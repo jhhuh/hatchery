@@ -44,15 +44,12 @@ data DispatchError
 instance Exception DispatchError
 
 -- | Opaque handle to a worker with pre-loaded code.
--- The ring buffer is mmap'd into the Haskell process for direct access.
+-- Wraps a WorkerMapping from the pool — the ring buffer and code region
+-- are already mmap'd by withHatchery.
 data PreparedWorker = PreparedWorker
   { pwHatchery  :: !Hatchery
   , pwWorkerId  :: !Word32
-  , pwRingPtr   :: !(Ptr ())      -- mmap'd ring buffer
-  , pwRingSize  :: !Word          -- ring buffer size (for munmap)
-  , pwWorkerPid :: !Int           -- worker PID (for liveness check)
-  , pwRingFd    :: !CInt          -- local fd for ring buffer memfd
-  , pwCodeFd    :: !CInt          -- local fd for code memfd (-1 if none)
+  , pwMapping   :: !WorkerMapping
   }
 
 -- FFI imports for direct dispatch
