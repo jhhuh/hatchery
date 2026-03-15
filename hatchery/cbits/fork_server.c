@@ -380,9 +380,14 @@ static void handle_dispatch(const struct command *cmd)
         if (st == WORKER_CRASHED || w->pid <= 0) {
             goto worker_crashed;
         }
-        /* Check if worker process is still alive */
-        if (sys_kill(w->pid, 0) < 0) {
-            goto worker_crashed;
+        /* Check if worker process has exited (kill returns 0 for zombies) */
+        {
+            int wstatus;
+            long wret = sys_call4(61 /*__NR_wait4*/, (long)w->pid,
+                                  (long)&wstatus, 1 /*WNOHANG*/, 0L);
+            if (wret > 0 || wret == -10 /*ECHILD*/) {
+                goto worker_crashed;
+            }
         }
         /* Wait on notify futex with timeout (100ms) to recheck liveness */
         uint32_t nv = atomic_load_explicit(&w->ring->notify,
