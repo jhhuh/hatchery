@@ -176,6 +176,17 @@ Haskell                          Fork Server                     Worker N
 Measured dispatch latency: ~5-6μs (excluding code execution time)
 ```
 
+### Latency Reference (measured, same `return 42` workload)
+
+```
+unsafe ccall:          ~0.00 us/call  (below CPUTime resolution)
+safe ccall:            ~0.07 us/call
+hatchery (vm_writev):  ~5.18 us/call  (includes code injection every dispatch)
+hatchery (memfd):      ~5.84 us/call  (includes code injection every dispatch)
+```
+
+**TODO**: Measure `foreign import prim` baseline. Add a "re-run same code" dispatch mode (skip injection) to isolate pure futex round-trip overhead — that's the fair comparison point against FFI.
+
 ## Implementation Status
 
 ### Phase 1: Minimal Viable Path — DONE
