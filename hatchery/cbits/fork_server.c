@@ -178,8 +178,20 @@ static void __attribute__((noreturn)) worker_main(int ring_fd, int code_fd,
 
     /* Worker loop */
     for (;;) {
-        uint32_t ctl = atomic_load_explicit(&ring->control,
-                                             memory_order_acquire);
+        /* Phase 1: spin */
+        unsigned int spins = spin_count;
+        uint32_t ctl;
+        for (unsigned int i = 0; i < spins; i++) {
+            ctl = atomic_load_explicit(&ring->control,
+                                        memory_order_acquire);
+            if (ctl == WORKER_RUN) goto run;
+            if (ctl == WORKER_STOP) sys_exit_group(0);
+            __builtin_ia32_pause();
+        }
+
+        /* Phase 2: futex fallback */
+        ctl = atomic_load_explicit(&ring->control,
+                                    memory_order_acquire);
         if (ctl == WORKER_IDLE) {
             futex_wait(&ring->control, WORKER_IDLE);
             continue;
@@ -187,6 +199,7 @@ static void __attribute__((noreturn)) worker_main(int ring_fd, int code_fd,
         if (ctl == WORKER_STOP)
             sys_exit_group(0);
 
+    run:
         /* ctl == WORKER_RUN */
         atomic_store_explicit(&ring->status, WORKER_BUSY,
                               memory_order_release);
@@ -207,7 +220,7 @@ static void __attribute__((noreturn)) worker_main(int ring_fd, int code_fd,
         atomic_store_explicit(&ring->status, WORKER_DONE,
                               memory_order_release);
 
-        /* Wake fork server */
+        /* Wake parent */
         atomic_store_explicit(&ring->notify, 1, memory_order_release);
         futex_wake(&ring->notify, 1);
     }
