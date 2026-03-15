@@ -1,0 +1,29 @@
+cabal-version: 3.0
+name:          hatchery
+version:       0.1.0.0
+synopsis:      Process sandbox toolkit with pre-spawned worker pools
+license:       BSD-3-Clause
+
+library
+  exposed-modules:
+    Hatchery
+    Hatchery.Config
+    Hatchery.Core
+    Hatchery.Dispatch
+  other-modules:
+    Hatchery.Internal.Memfd
+    Hatchery.Internal.Vfork
+    Hatchery.Internal.Protocol
+    Hatchery.Internal.Embedded
+  build-depends:
+    base >= 4.16 && < 5,
+    bytestring,
+    async,
+    unix,
+    file-embed
+  hs-source-dirs: src
+  c-sources:
+    cbits/vfork_helper.c
+  include-dirs: cbits
+  default-language: Haskell2010
+  ghc-options: -Wall
