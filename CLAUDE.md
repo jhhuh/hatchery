@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Phase 1 complete. Core sandbox works end-to-end (spawn → dispatch → result). LLVM integration stubbed (llvm-ffi build issue). **Active blocker**: dispatch hang — worker spawns but never completes execution. See `artifacts/devlog.md` for full history and debugging notes.
+Phase 1 complete. Core sandbox works end-to-end (spawn → dispatch → result → crash detection). LLVM integration stubbed (llvm-ffi build issue). See `artifacts/devlog.md` for history.
 
 ## What This Is
 
