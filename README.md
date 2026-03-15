@@ -161,7 +161,7 @@ The new architecture introduces payload-agnostic abstractions:
 - `Egg img f` — reification recipe pairing concrete seed with abstract method list
 - `Hatchery h` — typeclass for sandbox backends
 
-See [`docs/plans/2026-03-15-egg-object-architecture-design.md`](docs/plans/2026-03-15-egg-object-architecture-design.md) for the full design document.
+See [`docs/design.md`](docs/design.md) for the full design document.
 
 ## License
 

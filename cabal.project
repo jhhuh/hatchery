@@ -1,5 +1,0 @@
-packages:
-  hatchery/
-  hatchery-bench/
-  hatchery-llvm/
-  trustless-ffi/
