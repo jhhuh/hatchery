@@ -5,9 +5,8 @@ module Hatchery.Core
   , withHatchery
   ) where
 
-import Control.Concurrent (rtsSupportsBoundThreads, isCurrentThreadBound)
+import Control.Concurrent (runInBoundThread)
 import Control.Exception (bracket, SomeException, catch)
-import Control.Monad (when)
 import System.Posix.Types (Fd(..))
 import System.Posix.IO (closeFd)
 
@@ -31,16 +30,11 @@ injCapToInt SharedMemfdOnly     = 1
 injCapToInt BothMethods         = 2
 
 -- | Create a hatchery, run the action, then shut it down.
--- Must be called from a bound thread.
+-- Uses runInBoundThread to ensure the vfork happens on a bound OS thread,
+-- so PR_SET_PDEATHSIG on the fork server fires at the right time.
+-- Works with both -threaded and single-threaded RTS.
 withHatchery :: HatcheryConfig -> (Hatchery -> IO a) -> IO a
-withHatchery cfg action = do
-  -- Enforce bound thread
-  when (not rtsSupportsBoundThreads) $
-    error "withHatchery: requires -threaded RTS"
-  bound <- isCurrentThreadBound
-  when (not bound) $
-    error "withHatchery: must be called from a bound thread"
-
+withHatchery cfg action = runInBoundThread $
   bracket acquire release $ \h -> do
     -- Wait for all workers to report ready
     waitForWorkers h

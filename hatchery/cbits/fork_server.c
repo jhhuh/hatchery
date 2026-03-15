@@ -600,6 +600,11 @@ __attribute__((noreturn, used)) void real_start(unsigned long *sp)
 
     if (pool_size <= 0 || pool_size > MAX_WORKERS)
         sys_exit_group(2);
+
+    /* Die if parent thread exits (belt-and-suspenders with pipe trick).
+     * Safe because Haskell side uses runInBoundThread, so the OS thread
+     * that vfork'd us stays alive for the Hatchery's lifetime. */
+    sys_prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
     if (ring_buf_size < sizeof(struct ring_buffer))
         sys_exit_group(3);
 
