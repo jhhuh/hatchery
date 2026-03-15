@@ -36,29 +36,86 @@ trustless-ffi/     User API (wraps hatchery)
 5. **GCC 15 stack protector**: `-nostartfiles` binary has no TLS, but GCC 15 enables stack protector by default → reads `%fs:0x28` → segfault. Fixed with `-fno-stack-protector`.
 6. **GCC 15 `_start` prologue**: GCC modifies RSP before inline asm could capture it. Fixed with `__attribute__((naked))` on `_start`, separate `real_start` function.
 
-### CURRENT BLOCKER: Dispatch hang
+## 2026-03-15 — Dispatch hang resolved, direct dispatch API
 
-**Symptom**: Fork server starts, worker spawns, but dispatched code never completes. Fork server polls `futex_wait(notify, 0, 100ms timeout)` + `kill(pid, 0)` in a loop — worker is alive but stuck.
+### Root cause: `kill(pid, 0)` returns 0 for zombie processes
 
-**What works**: Fork server binary runs (no more segfault). Worker process spawns. `nix build .#hatchery` compiles the library.
+The "dispatch hang" was actually a **crash detection failure**, not a dispatch failure. The dispatch worked fine — code was injected and executed correctly. But when the fault tolerance test sent a UD2 instruction (intentional crash), the worker became a zombie, and `kill(pid, 0)` kept returning 0 (zombies have PID entries). The fork server looped forever thinking the worker was alive.
 
-**What doesn't work**: Worker never sets ring buffer status to WORKER_DONE after code dispatch. Happens with and without seccomp.
+**Fix**: Replaced `kill(pid, 0)` with `wait4(pid, WNOHANG)` which correctly reaps zombies.
 
-**Debugging done**:
-- Confirmed via strace: fork server enters dispatch, writes code via process_vm_writev, wakes worker futex, then polls notify futex — worker never wakes/completes
-- The earlier test (`cabal test hatchery-test`) was passing before the flake restructuring (commit `56568a6`). The flake changed from `mkShell` to `shellFor` around `83e3ec3`.
-- Both `-static-pie` and `-static -no-pie` produce working binaries (post stack-protector fix) that start and enter epoll loop, but dispatch coordination fails
+**How we found it**: strace with `-f` showed the first fork server (PID 2465073) handling dispatches correctly — all 2000+ warmup+benchmark dispatches succeeded. The hang was in the SECOND `withHatchery` (fault tolerance test, PID 2465075), which dispatched a 2-byte UD2 payload. The worker got SIGILL and died, but the fork server couldn't detect it.
 
-**Likely cause**: The worker's futex wait/wake or code execution path has an issue. Possibly:
-- Worker never receives the futex wake (futex address mismatch between fork server and worker?)
-- Worker wakes but crashes during code execution (seccomp or code region issue)
-- Ring buffer mmap not shared correctly between fork server and worker
+### Lifecycle improvements
 
-**Next step**: Add `sys_write(2, ...)` debug prints to worker_main in fork_server.c to trace exactly where the worker gets stuck (before/after futex_wait, before/after code execution).
+1. **`runInBoundThread` instead of manual bound-thread checks**: `withHatchery` now wraps the bracket in `runInBoundThread`, which works with both `-threaded` (creates bound thread if needed) and single-threaded RTS (runs directly). Removed the `-threaded` requirement.
+
+2. **`PR_SET_PDEATHSIG=SIGKILL` on fork server**: Belt-and-suspenders with the pipe trick. Safe because `runInBoundThread` guarantees the spawning OS thread lives for the Hatchery's lifetime.
+
+### Package restructure
+
+- Extracted `hatchery-bench` into a separate cabal package (reduces rebuild time when only library changes)
+- Bench includes both `-threaded` and single-threaded executables
+- Added FFI baseline comparison (unsafe ccall, safe ccall) to bench
+
+### `prepare`/`run`/`release` API for pre-loaded payloads
+
+New API allows loading code once and re-running without re-injection:
+
+```haskell
+prepare :: Hatchery -> InjectionMethod -> ByteString -> IO PreparedWorker
+run     :: PreparedWorker -> IO DispatchResult
+release :: PreparedWorker -> IO ()
+withPrepared :: Hatchery -> InjectionMethod -> ByteString -> (PreparedWorker -> IO a) -> IO a
+```
+
+Wire protocol additions: `CMD_RUN`, `CMD_RESERVE`, `CMD_RELEASE`, `RSP_WORKER_RESERVED`. Fork server tracks reserved workers and excludes them from auto-selection. Reserved workers' pidfds are removed from epoll (Haskell owns crash detection).
+
+### Direct Haskell↔worker dispatch
+
+For `PreparedWorker.run`, Haskell communicates directly with the worker via mmap'd ring buffer + futex, bypassing the fork server entirely:
+
+1. Fork server sends `ring_fd`, `code_fd`, `worker_pid` in `RSP_WORKER_RESERVED`
+2. Haskell duplicates fds via `pidfd_getfd` (requires fork server temporarily dumpable)
+3. Haskell mmaps the ring buffer
+4. `run`: `atomic_store(control=RUN)` → `futex_wake` → `futex_wait(notify)` → read result
+
+`PR_SET_DUMPABLE=0` is restored on the fork server after the `pidfd_getfd` window (next command closes it).
+
+### Measured latency (return 42 workload)
+
+```
+unsafe ccall:              <0.01 us/call
+safe ccall:                ~0.08 us/call
+hatchery (pre-loaded):     ~3.08 us/call  (direct futex, no fork server relay)
+hatchery (vm_writev):      ~5.23 us/call  (code injection every dispatch)
+hatchery (memfd):          ~5.96 us/call  (code injection every dispatch)
+```
+
+Both `-threaded` and single-threaded RTS work. Single-threaded is slightly faster (~5.1μs vs ~5.6μs for dispatch).
 
 ### Known issues
 - **No PID namespace isolation**: Phase 3 task.
-- **4096-byte code buffer in fork_server.c**: Caps injected code size. Phase 2.
-- **No worker respawn**: Crashed workers not replaced. Phase 2.
-- **Benchmark not yet run**: Blocked by dispatch hang.
-- **README latency claims**: "~3-5μs" is from design estimate, not measured.
+- **4096-byte code buffer in fork_server.c**: Caps injected code size.
+- **No worker respawn**: Crashed workers not replaced.
+- **Crash signal not reported**: `Crashed` result always has signal=0. Fork server's `wake_and_wait` doesn't capture the actual signal from `wait4`.
+- **`dispatch` still serializes code through socketpair**: Original design intended Haskell to write directly to code memfd. `prepare` path already has the fds — `dispatch` could do the same.
+
+## Next steps for following sessions
+
+### Immediate (Phase 2 completion)
+
+1. **Spin-wait mode for pre-loaded workers** — Replace futex with spin-loops on both sides. Target: sub-microsecond latency. Use `inline-cmm` (`github.com/jhhuh/inline-cmm`) for `foreign import prim` dispatch primitives to eliminate FFI overhead. This is the highest-impact optimization remaining.
+
+2. **Direct memfd writes for `dispatch`** — Extend the `pidfd_getfd` + mmap pattern from `prepare` to regular `dispatch`. Eliminate code serialization through the socketpair entirely. Socketpair carries only control signals.
+
+3. **ResourceT integration** — Add `ResourceT`-compatible API for flat registration of runtime foreign functions. Avoids bracket nesting for applications that discover/compile code dynamically (plugins, JIT, REPL).
+
+4. **Worker respawn** — When a worker crashes, fork server spawns a replacement via `fork()`. Update pool state, re-add pidfd to epoll.
+
+### Later (Phase 3+)
+
+5. **`CLONE_NEWPID`** — Fork server as PID 1 in a PID namespace. Belt-and-suspenders for worker cleanup.
+6. **Timeout enforcement** — timerfd per dispatch, integrated with epoll.
+7. **`foreign import prim` baseline measurement** — Complete the latency reference table.
+8. **TH compile pattern extraction** — The `compileForkServer` TH pattern (env var compiler + `addDependentFile` + `readProcessWithExitCode` in Q monad) is reusable. Consider extracting as a standalone package (`th-compile-embed` or similar).
