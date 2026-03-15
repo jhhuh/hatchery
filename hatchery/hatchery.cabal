@@ -45,6 +45,7 @@ test-suite hatchery-test
 executable hatchery-bench
   hs-source-dirs: bench
   main-is:        Main.hs
+  c-sources:      cbits/return42.c
   build-depends:
     base >= 4.16 && < 5,
     bytestring,
