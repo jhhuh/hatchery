@@ -184,10 +184,10 @@ safe ccall:                ~0.08 us/call
 hatchery (pre-loaded):     ~3.08 us/call  (direct futex, no fork server relay)
 hatchery (vm_writev):      ~5.23 us/call  (code injection every dispatch)
 hatchery (memfd):          ~5.96 us/call  (code injection every dispatch)
-hatchery (spin-wait):       TBD          (theoretical: ~0.1-0.5 us, zero syscalls)
+hatchery (spin-wait):      ~0.50 us/call  (Cmm spin N=10000, futex fallback)
 ```
 
-**TODO**: Measure `foreign import prim` baseline. Implement spin-wait mode for latency-critical pre-loaded workers.
+**TODO**: Measure `foreign import prim` baseline.
 
 ## Implementation Status
 
@@ -204,6 +204,7 @@ All core primitives working end-to-end: fork server spawn, worker pool, dual inj
 | Crash detection (wait4 in dispatch loop) | ✓ |
 | First-idle worker selection | ✓ |
 | Worker respawn after crash | ✗ |
+| Spin-wait mode for pre-loaded workers | ✓ |
 | `dispatchAsync` | ✗ |
 | Timeout support (timerfd) | ✗ |
 

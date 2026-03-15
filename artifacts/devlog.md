@@ -101,21 +101,58 @@ Both `-threaded` and single-threaded RTS work. Single-threaded is slightly faste
 - **Crash signal not reported**: `Crashed` result always has signal=0. Fork server's `wake_and_wait` doesn't capture the actual signal from `wait4`.
 - **`dispatch` still serializes code through socketpair**: Original design intended Haskell to write directly to code memfd. `prepare` path already has the fds — `dispatch` could do the same.
 
+## 2026-03-15 — Spin-wait mode implemented
+
+### Design
+
+Hybrid spin-then-futex on both sides:
+- **Worker side**: spin N iterations on `control` with `__builtin_ia32_pause()`, then fall back to `futex_wait`. Controlled by `spin_count` passed via fork server argv.
+- **Haskell side**: Cmm spin loop via `inline-cmm` (`foreign import prim`), bounded by spin_count. Returns to Haskell for safe FFI futex_wait fallback (releases GHC capability, allows GC).
+- **Crash detection**: Fork server keeps pidfd in epoll for reserved workers. On worker death, writes `WORKER_CRASHED` to `ring->status` and wakes futex. Haskell spin loop sees it naturally.
+
+### Config
+
+```haskell
+data WaitStrategy = FutexWait | SpinWait !Word32
+-- SpinWait 10000 = spin 10k iterations before futex fallback
+```
+
+### Cmm details
+
+- GHC Cmm `%acquire`/`%release` only support `W_` (machine word), not `bits32`. Used plain `bits32` loads/stores which are correct on x86_64 (TSO provides natural acquire/release). ARM would need `W_` loads with masking.
+- `inline-cmm`'s `[cmm|...|]` quasiquoter only parses single return type. Used `verbatim` + manual `foreign import prim` for the two-return-value function.
+- `#include "Cmm.h"` needed for `W_` macro; `W32` macro doesn't expand in memory access expressions, so used `bits32` directly.
+
+### Measured latency
+
+```
+unsafe ccall:              <0.01 us/call
+safe ccall:                ~0.07 us/call
+hatchery (pre-loaded):     ~3.22 us/call  (direct futex, no fork server relay)
+hatchery (spin-wait):      ~0.50 us/call  (Cmm spin, N=10000)
+hatchery (vm_writev):      ~5.50 us/call  (code injection every dispatch)
+hatchery (memfd):          ~5.52 us/call  (code injection every dispatch)
+```
+
+Spin-wait is **6.4x faster** than futex for the pre-loaded path.
+
+### Known issues
+- **x86_64 only**: Cmm spin uses plain loads (correct on x86 TSO). ARM needs `%acquire`/`%release` with `W_` and masking.
+- **No pause instruction in Cmm**: The Cmm spin loop doesn't emit `PAUSE` (x86 hint for spin-wait loops). GHC Cmm has no intrinsic for it. Could add via inline asm in future.
+- **`dispatch` still serializes through socketpair**: Unchanged from before.
+
 ## Next steps for following sessions
 
 ### Immediate (Phase 2 completion)
 
-1. **Spin-wait mode for pre-loaded workers** — Replace futex with spin-loops on both sides. Target: sub-microsecond latency. Use `inline-cmm` (`github.com/jhhuh/inline-cmm`) for `foreign import prim` dispatch primitives to eliminate FFI overhead. This is the highest-impact optimization remaining.
+1. **Direct memfd writes for `dispatch`** — Extend the `pidfd_getfd` + mmap pattern from `prepare` to regular `dispatch`. Eliminate code serialization through the socketpair entirely. Socketpair carries only control signals.
 
-2. **Direct memfd writes for `dispatch`** — Extend the `pidfd_getfd` + mmap pattern from `prepare` to regular `dispatch`. Eliminate code serialization through the socketpair entirely. Socketpair carries only control signals.
+2. **ResourceT integration** — Add `ResourceT`-compatible API for flat registration of runtime foreign functions. Avoids bracket nesting for applications that discover/compile code dynamically (plugins, JIT, REPL).
 
-3. **ResourceT integration** — Add `ResourceT`-compatible API for flat registration of runtime foreign functions. Avoids bracket nesting for applications that discover/compile code dynamically (plugins, JIT, REPL).
-
-4. **Worker respawn** — When a worker crashes, fork server spawns a replacement via `fork()`. Update pool state, re-add pidfd to epoll.
+3. **Worker respawn** — When a worker crashes, fork server spawns a replacement via `fork()`. Update pool state, re-add pidfd to epoll.
 
 ### Later (Phase 3+)
 
-5. **`CLONE_NEWPID`** — Fork server as PID 1 in a PID namespace. Belt-and-suspenders for worker cleanup.
-6. **Timeout enforcement** — timerfd per dispatch, integrated with epoll.
-7. **`foreign import prim` baseline measurement** — Complete the latency reference table.
-8. **TH compile pattern extraction** — The `compileForkServer` TH pattern (env var compiler + `addDependentFile` + `readProcessWithExitCode` in Q monad) is reusable. Consider extracting as a standalone package (`th-compile-embed` or similar).
+4. **`CLONE_NEWPID`** — Fork server as PID 1 in a PID namespace. Belt-and-suspenders for worker cleanup.
+5. **Timeout enforcement** — timerfd per dispatch, integrated with epoll.
+6. **TH compile pattern extraction** — The `compileForkServer` TH pattern (env var compiler + `addDependentFile` + `readProcessWithExitCode` in Q monad) is reusable. Consider extracting as a standalone package (`th-compile-embed` or similar).
