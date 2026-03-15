@@ -24,7 +24,8 @@ data InjectionMethod
 -- | Wait strategy for pre-loaded worker dispatch ('prepare'/'run').
 data WaitStrategy
   = FutexWait           -- ^ Pure futex wake\/wait (default, current behavior).
-  | SpinWait !Word32    -- ^ Spin N iterations, then fall back to futex.
+  | SpinWait !Word32    -- ^ Spin N iterations via Cmm (foreign import prim), then futex fallback.
+  | SpinWaitC !Word32   -- ^ Spin N iterations via C (unsafe ccall, GCC-inlined atomics), then futex fallback.
   deriving (Show, Eq)
 
 -- | Configuration for a hatchery worker pool.

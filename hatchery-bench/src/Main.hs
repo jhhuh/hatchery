@@ -73,6 +73,15 @@ main = do
       avgSpin <- timeN hn (run pw)
       printf "  hatchery (spin-wait):  %7.1f ns/call  (%d calls)\n" avgSpin hn
 
+  -- Spin-wait C (unsafe ccall, GCC-inlined atomics)
+  let spinCCfg = defaultConfig { poolSize = 2, waitStrategy = SpinWaitC 10000 }
+  withHatchery spinCCfg $ \h -> do
+    withPrepared h UseSharedMemfd payload $ \pw -> do
+      mapM_ (\_ -> run pw) [1..10 :: Int]
+
+      avgSpinC <- timeN hn (run pw)
+      printf "  hatchery (spin-C):     %7.1f ns/call  (%d calls)\n" avgSpinC hn
+
   -- Fault tolerance demo
   putStrLn ""
   putStrLn "=== Fault Tolerance ==="

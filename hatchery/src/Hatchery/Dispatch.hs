@@ -76,6 +76,9 @@ foreign import ccall "hatchery_result_size"
 foreign import ccall "hatchery_result_data"
   c_result_data :: Ptr () -> IO (Ptr Word8)
 
+foreign import ccall unsafe "hatchery_spin_wait_c"
+  c_spin_wait :: Ptr () -> Word32 -> Ptr Int32 -> IO CInt
+
 foreign import ccall safe "hatchery_futex_wait_safe"
   c_futex_wait_safe :: Ptr () -> IO CInt
 
@@ -192,8 +195,9 @@ run :: PreparedWorker -> IO DispatchResult
 run pw = do
   c_wake_worker (pwRingPtr pw)
   case waitStrategy (hConfig (pwHatchery pw)) of
-    FutexWait  -> runFutex pw
-    SpinWait n -> runSpin pw n
+    FutexWait   -> runFutex pw
+    SpinWait n  -> runSpin pw n
+    SpinWaitC n -> runSpinC pw n
 
 -- | Original futex-based wait.
 runFutex :: PreparedWorker -> IO DispatchResult
@@ -204,7 +208,7 @@ runFutex pw =
       then readResult pw ecPtr
       else return $ Crashed 0
 
--- | Spin-wait with futex fallback.
+-- | Spin-wait with futex fallback (Cmm via inline-cmm).
 runSpin :: PreparedWorker -> Word32 -> IO DispatchResult
 runSpin pw n = go
   where
@@ -219,9 +223,29 @@ runSpin pw n = go
           else return $ Completed (fromIntegral ec) Nothing
       (1, _) -> return $ Crashed 0
       _      -> do
-        -- Spins exhausted: futex wait (safe FFI, releases capability)
         _ <- c_futex_wait_safe (pwRingPtr pw)
         go
+
+-- | Spin-wait with futex fallback (C, atomics inlined by GCC).
+runSpinC :: PreparedWorker -> Word32 -> IO DispatchResult
+runSpinC pw n = alloca $ \ecPtr -> go ecPtr
+  where
+    go ecPtr = do
+      ret <- c_spin_wait (pwRingPtr pw) n ecPtr
+      case ret of
+        0 -> do
+          ec <- peek ecPtr
+          rsz <- c_result_size (pwRingPtr pw)
+          if rsz > 0
+            then do
+              dataPtr <- c_result_data (pwRingPtr pw)
+              bs <- BS.packCStringLen (castPtr dataPtr, fromIntegral rsz)
+              return $ Completed ec (Just bs)
+            else return $ Completed ec Nothing
+        1 -> return $ Crashed 0
+        _ -> do
+          _ <- c_futex_wait_safe (pwRingPtr pw)
+          go ecPtr
 
 -- | Read result after successful futex wait.
 readResult :: PreparedWorker -> Ptr Int32 -> IO DispatchResult

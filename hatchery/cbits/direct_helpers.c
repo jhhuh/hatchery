@@ -102,7 +102,7 @@ int hatchery_futex_wait_safe(void *ring_base)
     return 0;
 }
 
-/* Seq_cst atomic helpers for Cmm spin loop */
+/* Seq_cst atomic helpers (used by Cmm spin loop fallback) */
 uint32_t hatchery_atomic_read32(void *addr)
 {
     return __atomic_load_n((uint32_t *)addr, __ATOMIC_SEQ_CST);
@@ -111,6 +111,32 @@ uint32_t hatchery_atomic_read32(void *addr)
 void hatchery_atomic_write32(void *addr, uint32_t val)
 {
     __atomic_store_n((uint32_t *)addr, val, __ATOMIC_SEQ_CST);
+}
+
+/* Spin-wait on ring buffer status. Returns:
+ *  0 = done (exit_code written to *out_exit_code)
+ *  1 = crashed
+ *  2 = spins exhausted (caller should futex-wait and retry)
+ *
+ * All atomics inlined by GCC. No function call per iteration. */
+int hatchery_spin_wait_c(void *ring_base, uint32_t spin_count, int32_t *out_exit_code)
+{
+    uint32_t *status = (uint32_t *)((char *)ring_base + RING_STATUS_OFF);
+    uint32_t *notify = (uint32_t *)((char *)ring_base + RING_NOTIFY_OFF);
+    int32_t  *ec_ptr = (int32_t  *)((char *)ring_base + RING_EXIT_CODE_OFF);
+
+    for (uint32_t i = 0; i < spin_count; i++) {
+        uint32_t st = __atomic_load_n(status, __ATOMIC_SEQ_CST);
+        if (st == WORKER_DONE) {
+            *out_exit_code = __atomic_load_n(ec_ptr, __ATOMIC_SEQ_CST);
+            __atomic_store_n(notify, 0, __ATOMIC_SEQ_CST);
+            __atomic_store_n(status, WORKER_READY, __ATOMIC_SEQ_CST);
+            return 0;
+        }
+        if (st == 4 /* WORKER_CRASHED */)
+            return 1;
+    }
+    return 2;
 }
 
 /* Read result_size from ring buffer */

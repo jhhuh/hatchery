@@ -43,8 +43,9 @@ withHatchery cfg action = inBoundThread $
   where
     acquire = do
       let sc = case waitStrategy cfg of
-                 FutexWait  -> 0 :: Word32
-                 SpinWait n -> n
+                 FutexWait   -> 0 :: Word32
+                 SpinWait n  -> n
+                 SpinWaitC n -> n
       sr <- spawnForkServer
         forkServerELF
         (poolSize cfg)
