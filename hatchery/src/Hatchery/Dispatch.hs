@@ -21,9 +21,10 @@ import Foreign.Storable (peek)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.C.Types
 
-import Hatchery.Config (InjectionCapability(..), InjectionMethod(..), HatcheryConfig(..))
+import Hatchery.Config (InjectionCapability(..), InjectionMethod(..), HatcheryConfig(..), WaitStrategy(..))
 import Hatchery.Core (Hatchery(..))
 import Hatchery.Internal.Protocol
+import Hatchery.Internal.SpinWait (spinWait)
 
 data DispatchResult
   = Completed !Int32 !(Maybe ByteString)  -- exit code + optional result bytes
@@ -74,6 +75,9 @@ foreign import ccall "hatchery_result_size"
 
 foreign import ccall "hatchery_result_data"
   c_result_data :: Ptr () -> IO (Ptr Word8)
+
+foreign import ccall safe "hatchery_futex_wait_safe"
+  c_futex_wait_safe :: Ptr () -> IO CInt
 
 foreign import ccall "close"
   c_close :: CInt -> IO CInt
@@ -187,19 +191,49 @@ prepare h method codeBytes = do
 run :: PreparedWorker -> IO DispatchResult
 run pw = do
   c_wake_worker (pwRingPtr pw)
+  case waitStrategy (hConfig (pwHatchery pw)) of
+    FutexWait  -> runFutex pw
+    SpinWait n -> runSpin pw n
+
+-- | Original futex-based wait.
+runFutex :: PreparedWorker -> IO DispatchResult
+runFutex pw =
   alloca $ \ecPtr -> do
     ret <- c_wait_worker (pwRingPtr pw) (fromIntegral (pwWorkerPid pw)) ecPtr
     if ret == 0
-      then do
-        ec <- peek ecPtr
+      then readResult pw ecPtr
+      else return $ Crashed 0
+
+-- | Spin-wait with futex fallback.
+runSpin :: PreparedWorker -> Word32 -> IO DispatchResult
+runSpin pw n = go
+  where
+    go = case spinWait (pwRingPtr pw) n of
+      (0, ec) -> do
         rsz <- c_result_size (pwRingPtr pw)
         if rsz > 0
           then do
             dataPtr <- c_result_data (pwRingPtr pw)
             bs <- BS.packCStringLen (castPtr dataPtr, fromIntegral rsz)
-            return $ Completed ec (Just bs)
-          else return $ Completed ec Nothing
-      else return $ Crashed 0
+            return $ Completed (fromIntegral ec) (Just bs)
+          else return $ Completed (fromIntegral ec) Nothing
+      (1, _) -> return $ Crashed 0
+      _      -> do
+        -- Spins exhausted: futex wait (safe FFI, releases capability)
+        _ <- c_futex_wait_safe (pwRingPtr pw)
+        go
+
+-- | Read result after successful futex wait.
+readResult :: PreparedWorker -> Ptr Int32 -> IO DispatchResult
+readResult pw ecPtr = do
+  ec <- peek ecPtr
+  rsz <- c_result_size (pwRingPtr pw)
+  if rsz > 0
+    then do
+      dataPtr <- c_result_data (pwRingPtr pw)
+      bs <- BS.packCStringLen (castPtr dataPtr, fromIntegral rsz)
+      return $ Completed ec (Just bs)
+    else return $ Completed ec Nothing
 
 -- | Release a reserved worker back to the pool.
 release :: PreparedWorker -> IO ()

@@ -89,6 +89,19 @@ int hatchery_wait_worker(void *ring_base, int worker_pid, int *out_exit_code)
     }
 }
 
+/* Safe futex wait on notify field with 100ms timeout.
+ * Intended for safe FFI call (releases GHC capability during wait). */
+int hatchery_futex_wait_safe(void *ring_base)
+{
+    uint32_t *notify = (uint32_t *)((char *)ring_base + RING_NOTIFY_OFF);
+    uint32_t nv = __atomic_load_n(notify, __ATOMIC_ACQUIRE);
+    if (nv == 0) {
+        struct timespec ts = { 0, 100000000L };
+        syscall(__NR_futex, notify, FUTEX_WAIT, 0, &ts, NULL, 0);
+    }
+    return 0;
+}
+
 /* Read result_size from ring buffer */
 uint32_t hatchery_result_size(void *ring_base)
 {
