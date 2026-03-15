@@ -14,6 +14,60 @@ Hatchery currently bakes in too many payload-specific assumptions at the core le
 
 The core sandbox should be **payload-agnostic**. Specific strategies for handling input and output belong in higher abstractions built on top. The low-level library should open the hatch for such possibilities.
 
+## Type-Theoretic Foundation
+
+### Object as Coalgebra
+
+In coalgebraic semantics, an **object** is a state together with observations on that state. Unlike algebraic data types (which are defined by how you *construct* them), coalgebraic types are defined by how you *observe* them — their interface. A mutable object is a coalgebra of the functor describing its observable behavior.
+
+Our `Object` type captures this precisely:
+
+```haskell
+data Object f m = Object
+  { method :: forall t. f t -> m (t, Object f m)
+  }
+```
+
+The key semantic property is that **observation mutates**. There is no distinction between "reading" and "writing" — every interaction `f t -> m (t, Object f m)` produces a result `t` and a *new* object. The returned object may behave differently from the original, even for the same method call. This reflects physical reality: the object is backed by mutable state where even observation (reading a register, probing memory) transitions the system.
+
+This distinguishes `Object` from the `Machine` type in `machines` (which models demand-driven stream transducers via `Await`/`Yield`/`Stop`). A Machine has `step` but no typed methods. An Object has typed methods (via the GADT `f`) but no `Yield` — it responds to stimuli rather than producing a stream. Same state-transition semantics, opposite control flow: Machine is pull-based, Object is call-based.
+
+### Egg as Reification Recipe
+
+The novel contribution is the **Egg**: a recipe for reifying an abstract specification into a live coalgebraic object.
+
+```haskell
+data Egg img f = Egg
+  { eConfig      :: WorkerConfig       -- the seed: concrete initial state
+  , eInterpreter :: img -> f ~> IO     -- the method table: GADT → effects
+  }
+```
+
+An Egg carries two things:
+
+1. **The seed** (`eConfig` / `WorkerConfig`) — a concrete, value-level blob that describes the initial physical state of the object: memory layout, security policy, resource limits. This is the material from which the object is born.
+
+2. **The abstract method list** (`f`, a GADT, at the type level) paired with its interpreter (`f ~> IO`, a natural transformation, at the value level) — the behavioral specification. Each constructor of `f` is a typed method signature. The interpreter maps each method to concrete effects on the backend's Image.
+
+The Egg fuses **concrete genesis** (the seed) with **abstract interface** (the GADT). The `hatch` operation then reifies this specification into a live `Object f m` by:
+- Allocating physical resources according to the seed (spawning a worker process, mapping shared memory, installing security filters)
+- Wiring the interpreter to the allocated Image, closing over the mutable state
+- Returning a coalgebraic object whose methods dispatch through the interpreter
+
+This is a form of **type-safe object reification**: the GADT ensures that each method's input and output types are statically checked, while the interpreter provides the dynamic behavior. The result is an object whose interface is abstract (determined by `f`) but whose implementation is grounded in physical resources (determined by the seed and the Hatchery backend).
+
+### Compositionality
+
+Method lists compose via coproduct (`f :+: g`), giving the object a richer interface without changing the underlying object model. This is the coalgebraic analogue of mixin composition: the object's observable behavior is the union of two method sets, each interpreted independently.
+
+```haskell
+data (f :+: g) t where
+  L :: f t -> (f :+: g) t
+  R :: g t -> (f :+: g) t
+```
+
+The `combine` operation on Eggs merges both seeds and both interpreters, producing an Egg whose hatched Object supports methods from both `f` and `g`.
+
 ## Core Abstraction: Hatchery Typeclass + Egg → Object
 
 The design models a sandbox as an **abstract physical computer**:
@@ -98,11 +152,9 @@ instance Hatchery MockSandbox where
 
 The typeclass makes sense at this level because the backend is a **compile-time / deployment-time choice** — you don't dynamically switch between linux namespaces and KVM at runtime. The dynamic flexibility lives in the Egg/Object layer.
 
-## Object: Coalgebraic Machine with Methods
+## Object: API
 
-An Object is a coalgebraic mutable automaton — a Machine (in the `machines` package sense) that also has typed methods. Each interaction mutates the object and produces a typed result along with the new object.
-
-**Key semantic property: observation mutates.** There is no pure read. Every interaction — even "reading a register" — is an effectful step that transitions the object's state. This reflects the physical reality: the object is backed by a live process whose memory, registers, and execution state are all entangled.
+The Object type and its semantics are described in the Type-Theoretic Foundation above. The API:
 
 ```haskell
 data Object f m = Object
@@ -112,14 +164,6 @@ data Object f m = Object
 -- Convenience
 call :: Monad m => Object f m -> f t -> m (t, Object f m)
 call obj msg = method obj msg
-```
-
-The `f` parameter is a GADT defining the object's method list. Each constructor is a method with typed input and output:
-
-```haskell
-data SomeMethodList t where
-  MethodA :: ArgType -> SomeMethodList ReturnType
-  MethodB :: SomeMethodList OtherReturnType
 ```
 
 ## Image: Backend-Specific Concrete State
