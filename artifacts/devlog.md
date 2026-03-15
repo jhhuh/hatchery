@@ -160,11 +160,45 @@ This is at the hardware floor — you can't communicate between two processes fa
 **memfd vs vm_writev (6231 vs 5561ns)**: Similar magnitude, noise-level difference for small payloads (6 bytes). Both involve a kernel write path. Larger payloads would favor memfd (no per-page cross-process table walk).
 
 ### Known issues
-- **Hardcoded ring buffer offsets**: `direct_helpers.c` and Cmm code have hardcoded byte offsets (e.g. `RING_STATUS_OFF 128`, `exit_code` at 164). Fragile — adding/reordering fields requires manual offset recalculation. Should migrate to `.hsc` or generate offsets from `ring_buffer.h`.
+- ~~**Hardcoded ring buffer offsets**~~: Resolved — see below.
 - **ccall overhead in Cmm spin loop**: Each poll iteration calls `hatchery_atomic_read32` via ccall (cross-compilation-unit, no inlining). On x86 where seq_cst loads are free MOVs, the ccall overhead dominates the per-iteration cost.
 - **x86_64 only**: Cmm spin uses seq_cst via C wrappers. ARM would need different treatment.
 - **`dispatch` still serializes through socketpair**: Unchanged from before.
 - **No core pinning in benchmarks**: ~370ns may include scheduler jitter. `taskset` pinning to same-socket cores could reveal lower floor.
+
+## 2026-03-15 — Ring buffer offset hardcoding eliminated
+
+### Problem
+
+Ring buffer struct offsets were hardcoded in three places:
+- `direct_helpers.c`: `#define RING_STATUS_OFF 128` etc.
+- `SpinWait.hs` Cmm string: `ring_base + 128`, `ring_base + 164`, `ring_base + 64`
+- `ring_buffer.h`: the struct definition (source of truth)
+
+Adding or reordering fields required manually recalculating offsets in all three locations.
+
+### Solution
+
+Split `ring_buffer.h` into `ring_buffer_layout.h` (struct + enums only, no syscall.h/futex deps) and a thin `ring_buffer.h` wrapper. This enables:
+
+1. **`direct_helpers.c`**: replaced hardcoded `#define`s with `offsetof(struct ring_buffer, field)` via `#include "ring_buffer_layout.h"`.
+2. **`RingOffsets.hsc`**: new module using `hsc2hs` `#{offset struct ring_buffer, field}` to generate Haskell constants at build time.
+3. **`SpinWait.hs`**: imports `RingOffsets` and splices values into the Cmm `verbatim` string via `show`.
+
+Header split was needed because `ring_buffer.h` includes `syscall.h` (inline asm) which is incompatible with hsc2hs. `ring_buffer_layout.h` only needs `<stdint.h>` + `<stdatomic.h>`.
+
+TH staging restriction requires offsets in a separate module from the `verbatim` splice — hence `RingOffsets.hsc` rather than putting `#{offset}` directly in `SpinWait.hsc`.
+
+### Verified
+
+Benchmark numbers unchanged (no regression):
+```
+hatchery (spin-wait Cmm): 364  ns
+hatchery (spin-wait C):   365  ns
+hatchery (pre-loaded):   3192  ns
+hatchery (vm_writev):    5515  ns
+hatchery (memfd):        5949  ns
+```
 
 ## Next steps for following sessions
 

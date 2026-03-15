@@ -8,26 +8,22 @@
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <stdint.h>
+#include <stddef.h>
 #include <signal.h>
 #include <linux/futex.h>
 #include <time.h>
 
-/* Ring buffer offsets (must match ring_buffer.h) */
-#define RING_CONTROL_OFF    0
-#define RING_NOTIFY_OFF    64
-#define RING_STATUS_OFF   128
-#define RING_SPIN_MODE_OFF 160
-#define RING_EXIT_CODE_OFF 164
-#define RING_RESULT_OFF_OFF 168
-#define RING_RESULT_SIZE_OFF 172
-#define RING_DATA_OFF      192
+#include "ring_buffer_layout.h"
 
-/* Worker states */
-#define WORKER_IDLE  0
-#define WORKER_RUN   1
-#define WORKER_READY 1
-#define WORKER_DONE  3
+/* Ring buffer offsets (computed from struct definition) */
+#define RING_CONTROL_OFF    offsetof(struct ring_buffer, control)
+#define RING_NOTIFY_OFF     offsetof(struct ring_buffer, notify)
+#define RING_STATUS_OFF     offsetof(struct ring_buffer, status)
+#define RING_SPIN_MODE_OFF  offsetof(struct ring_buffer, spin_mode)
+#define RING_EXIT_CODE_OFF  offsetof(struct ring_buffer, exit_code)
+#define RING_RESULT_OFF_OFF offsetof(struct ring_buffer, result_offset)
+#define RING_RESULT_SIZE_OFF offsetof(struct ring_buffer, result_size)
+#define RING_DATA_OFF       offsetof(struct ring_buffer, data)
 
 int hatchery_pidfd_getfd(int pidfd, int targetfd)
 {

@@ -16,6 +16,7 @@ library
     Hatchery.Internal.Vfork
     Hatchery.Internal.Protocol
     Hatchery.Internal.Embedded
+    Hatchery.Internal.RingOffsets
     Hatchery.Internal.SpinWait
   build-depends:
     base >= 4.16 && < 5,

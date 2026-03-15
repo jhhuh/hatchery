@@ -64,7 +64,7 @@ GHC Process → socketpair/pipe → Fork Server (static-PIE C, embedded in binar
 
 - **Fork server** (`cbits/fork_server.c`): Pure C, static-PIE ELF (musl), no libc, raw syscalls (`syscall.h`). Single-threaded epoll loop. Spawns workers via `fork()`. Entry point: `_start` (naked) → `real_start` (parses argc/argv for fd numbers and config).
 - **Workers**: Own address space, PROT_RWX code region, MAP_SHARED ring buffer (memfd), seccomp filter. Execute injected machine code as `int fn(void)`.
-- **Communication**: socketpair for commands (`protocol.h` structs, 16-byte command / 20-byte response), ring buffer for data + synchronization. Futex or spin-wait for worker wake/notify.
+- **Communication**: socketpair for commands (`protocol.h` structs, 16-byte command / 20-byte response), ring buffer for data + synchronization. Futex or spin-wait for worker wake/notify. Ring buffer layout defined in `ring_buffer_layout.h`; field offsets generated at build time via `hsc2hs` (`RingOffsets.hsc`) and `offsetof()` (`direct_helpers.c`).
 - **Lifecycle**: Parent death → pipe EOF → fork server exits. Worker crash detected via pidfd epoll (fork server writes `WORKER_CRASHED` to ring buffer).
 - **Haskell spawn path**: `Core.withHatchery` → `Vfork.spawnForkServer` (FFI to `vfork_helper.c`) → `execveat` of the embedded ELF via memfd.
 
