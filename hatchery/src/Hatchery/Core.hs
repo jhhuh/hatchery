@@ -11,6 +11,7 @@ import System.Posix.Types (Fd(..))
 import System.Posix.IO (closeFd)
 
 import Hatchery.Config
+import Data.Word (Word32)
 import Hatchery.Internal.Embedded (forkServerELF)
 import Hatchery.Internal.Vfork (SpawnResult(..), spawnForkServer)
 import Hatchery.Internal.Protocol (Command(..), sendCommand, recvResponse)
@@ -41,12 +42,16 @@ withHatchery cfg action = inBoundThread $
     action h
   where
     acquire = do
+      let sc = case waitStrategy cfg of
+                 FutexWait  -> 0 :: Word32
+                 SpinWait n -> n
       sr <- spawnForkServer
         forkServerELF
         (poolSize cfg)
         (injCapToInt (injectionCapability cfg))
         (codeRegionSize cfg)
         (ringBufSize cfg)
+        sc
       return $ Hatchery
         { hSockFd     = Fd (fromIntegral (srSockFd sr))
         , hLivenessFd = Fd (fromIntegral (srLivenessFd sr))

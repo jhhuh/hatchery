@@ -7,7 +7,7 @@ import Foreign.C.Types
 import Foreign.Ptr
 import Foreign.Storable
 import Foreign.Marshal.Alloc (alloca)
-import Data.Word (Word8)
+import Data.Word (Word8, Word32)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Unsafe as BSU
 
@@ -39,6 +39,7 @@ foreign import ccall "spawn_fork_server"
     -> CInt             -- injection_cap
     -> CULong           -- code_region_size
     -> CULong           -- ring_buf_size
+    -> CUInt            -- spin_count
     -> Ptr SpawnResult  -- out
     -> IO CInt          -- returns 0 on success, -errno on failure
 
@@ -48,8 +49,9 @@ spawnForkServer :: ByteString  -- ^ Fork server ELF binary
                -> Int          -- ^ Injection capability (0/1/2)
                -> Word         -- ^ Code region size
                -> Word         -- ^ Ring buffer size
+               -> Word32       -- ^ Spin count (0 = pure futex)
                -> IO SpawnResult
-spawnForkServer elf poolSz injCap crSize rbSize =
+spawnForkServer elf poolSz injCap crSize rbSize spinCount =
   BSU.unsafeUseAsCStringLen elf $ \(ptr, len) ->
     alloca $ \outPtr -> do
       ret <- c_spawn_fork_server
@@ -59,6 +61,7 @@ spawnForkServer elf poolSz injCap crSize rbSize =
         (fromIntegral injCap)
         (fromIntegral crSize)
         (fromIntegral rbSize)
+        (fromIntegral spinCount)
         outPtr
       if ret /= 0
         then ioError (userError $ "spawn_fork_server failed: " ++ show ret)

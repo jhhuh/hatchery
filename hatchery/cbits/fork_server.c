@@ -59,6 +59,7 @@ static unsigned long code_region_size;
 static unsigned long ring_buf_size;
 static int epfd;                /* epoll fd */
 static int dumpable_window;     /* set after CMD_RESERVE, cleared on next command */
+static unsigned int spin_count; /* spin iterations before futex fallback (0 = pure futex) */
 
 /* ── Forward declarations ───────────────────────────────────────────── */
 
@@ -699,15 +700,16 @@ __attribute__((noreturn, used)) void real_start(unsigned long *sp)
     int argc = (int)sp[0];
     char **argv = (char **)(sp + 1);
 
-    if (argc < 7)
+    if (argc < 8)
         sys_exit_group(1);
 
-    sock_fd         = simple_atoi(argv[1]);
-    pipe_fd         = simple_atoi(argv[2]);
-    pool_size       = simple_atoi(argv[3]);
-    injection_cap   = simple_atoi(argv[4]);
+    sock_fd          = simple_atoi(argv[1]);
+    pipe_fd          = simple_atoi(argv[2]);
+    pool_size        = simple_atoi(argv[3]);
+    injection_cap    = simple_atoi(argv[4]);
     code_region_size = (unsigned long)simple_atoi(argv[5]);
     ring_buf_size    = (unsigned long)simple_atoi(argv[6]);
+    spin_count       = (unsigned int)simple_atoi(argv[7]);
 
     if (pool_size <= 0 || pool_size > MAX_WORKERS)
         sys_exit_group(2);

@@ -66,6 +66,7 @@ int spawn_fork_server(
     int injection_cap,
     unsigned long code_region_size,
     unsigned long ring_buf_size,
+    unsigned int spin_count,
     struct spawn_result *out)
 {
     int memfd = -1, sv[2] = {-1, -1}, pipefd[2] = {-1, -1};
@@ -111,15 +112,16 @@ int spawn_fork_server(
      *    argv[5] = code_region_size
      *    argv[6] = ring_buf_size */
     char arg0[] = "fork_server";
-    char arg1[16], arg2[16], arg3[16], arg4[16], arg5[32], arg6[32];
+    char arg1[16], arg2[16], arg3[16], arg4[16], arg5[32], arg6[32], arg7[16];
     snprintf(arg1, sizeof(arg1), "%d", sv[1]);
     snprintf(arg2, sizeof(arg2), "%d", pipefd[0]);
     snprintf(arg3, sizeof(arg3), "%d", pool_size);
     snprintf(arg4, sizeof(arg4), "%d", injection_cap);
     snprintf(arg5, sizeof(arg5), "%lu", code_region_size);
     snprintf(arg6, sizeof(arg6), "%lu", ring_buf_size);
+    snprintf(arg7, sizeof(arg7), "%u", spin_count);
 
-    char *argv[] = { arg0, arg1, arg2, arg3, arg4, arg5, arg6, NULL };
+    char *argv[] = { arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, NULL };
 
     /* 6. vfork + execveat into the memfd */
     pid_t pid = vfork();
