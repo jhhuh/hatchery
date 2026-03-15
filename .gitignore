@@ -1,0 +1,10 @@
+dist-newstyle/
+result
+result-*
+*.o
+*.hi
+*.dyn_o
+*.dyn_hi
+fork_server
+worker_template
+.direnv/
