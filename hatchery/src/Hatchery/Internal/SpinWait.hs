@@ -28,9 +28,8 @@ include "\"Cmm.h\""
 --   WORKER_DONE    = 3
 --   WORKER_CRASHED = 4
 
--- On x86_64, all loads are naturally acquire and all stores are
--- naturally release (TSO). Plain bits32 loads/stores are correct.
--- For ARM, this would need %acquire/%release with W_ and masking.
+-- Uses hatchery_atomic_read32/write32 (seq_cst wrappers in direct_helpers.c)
+-- for correct memory ordering. On x86, seq_cst load = MOV, seq_cst store = XCHG.
 verbatim "\
 \hatchery_spin_wait (W_ ring_base, W_ spin_count)\n\
 \{\n\
@@ -42,7 +41,7 @@ verbatim "\
 \again:\n\
 \    if (i >= spin_count) goto exhausted;\n\
 \\n\
-\    st = bits32[status_addr];\n\
+\    (st) = ccall hatchery_atomic_read32(status_addr);\n\
 \    if (st == 3) goto done;\n\
 \    if (st == 4) goto crashed;\n\
 \\n\
@@ -51,10 +50,10 @@ verbatim "\
 \\n\
 \done:\n\
 \    W_ ec;\n\
-\    ec = bits32[ring_base + 216];\n\
+\    (ec) = ccall hatchery_atomic_read32(ring_base + 216);\n\
 \\n\
-\    bits32[ring_base + 64] = 0;\n\
-\    bits32[status_addr] = 1;\n\
+\    ccall hatchery_atomic_write32(ring_base + 64, 0);\n\
+\    ccall hatchery_atomic_write32(status_addr, 1);\n\
 \\n\
 \    return (0, ec);\n\
 \\n\

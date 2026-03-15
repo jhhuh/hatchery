@@ -102,6 +102,17 @@ int hatchery_futex_wait_safe(void *ring_base)
     return 0;
 }
 
+/* Seq_cst atomic helpers for Cmm spin loop */
+uint32_t hatchery_atomic_read32(void *addr)
+{
+    return __atomic_load_n((uint32_t *)addr, __ATOMIC_SEQ_CST);
+}
+
+void hatchery_atomic_write32(void *addr, uint32_t val)
+{
+    __atomic_store_n((uint32_t *)addr, val, __ATOMIC_SEQ_CST);
+}
+
 /* Read result_size from ring buffer */
 uint32_t hatchery_result_size(void *ring_base)
 {
