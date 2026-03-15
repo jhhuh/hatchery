@@ -10,6 +10,12 @@ module Hatchery
   , dispatch
   , DispatchResult(..)
   , DispatchError(..)
+    -- * Pre-loaded payloads
+  , PreparedWorker
+  , prepare
+  , run
+  , release
+  , withPrepared
   ) where
 
 import Hatchery.Config

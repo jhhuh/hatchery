@@ -49,6 +49,15 @@ main = do
     avgVmw <- timeN hn (dispatch h UseProcessVmWritev payload)
     printf "  hatchery (vm_writev): %8.2f us/call  (%d calls)\n" avgVmw hn
 
+  -- Pre-loaded payload (no re-injection)
+  withHatchery defaultConfig { poolSize = 2 } $ \h -> do
+    withPrepared h UseSharedMemfd payload $ \pw -> do
+      -- warmup
+      mapM_ (\_ -> run pw) [1..10 :: Int]
+
+      avgRun <- timeN hn (run pw)
+      printf "  hatchery (pre-loaded): %7.2f us/call  (%d calls)\n" avgRun hn
+
   -- Fault tolerance demo
   putStrLn ""
   putStrLn "=== Fault Tolerance ==="

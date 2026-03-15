@@ -47,6 +47,9 @@ injectionMethodToWord WireSharedMemfd     = 1
 
 data Command
   = CmdDispatch !DispatchCmd !ByteString  -- dispatch command + code bytes
+  | CmdRun !Word32                        -- re-run on specific worker (no injection)
+  | CmdReserve !Word32                    -- reserve a worker (maxBound = auto-select)
+  | CmdRelease !Word32                    -- release a reserved worker
   | CmdStatus
   | CmdShutdown
   deriving (Show)
@@ -67,6 +70,7 @@ data Response
   | RspWorkerCrashed !WorkerCrashedRsp
   | RspPoolStatus !PoolStatusRsp
   | RspError !Int32
+  | RspWorkerReserved !Word32        -- worker_id
   deriving (Show)
 
 data WorkerDoneRsp = WorkerDoneRsp
@@ -141,6 +145,18 @@ sendCommand fd cmd = allocaBytes commandSize $ \buf -> do
       let (fptr, off, clen) = BSI.toForeignPtr codeBytes
       withForeignPtr fptr $ \p ->
         writeAll fd (p `plusPtr` off) clen
+    CmdRun wid -> do
+      pokeW32 buf 0 4  -- CMD_RUN
+      pokeW32 buf 4 wid
+      writeAll fd buf commandSize
+    CmdReserve wid -> do
+      pokeW32 buf 0 5  -- CMD_RESERVE
+      pokeW32 buf 4 wid
+      writeAll fd buf commandSize
+    CmdRelease wid -> do
+      pokeW32 buf 0 6  -- CMD_RELEASE
+      pokeW32 buf 4 wid
+      writeAll fd buf commandSize
     CmdStatus -> do
       pokeW32 buf 0 2  -- CMD_STATUS
       writeAll fd buf commandSize
@@ -184,4 +200,7 @@ recvResponse fd = allocaBytes responseSize $ \buf -> do
     5 -> do  -- RSP_ERROR
       code <- peekI32 buf 4
       return (RspError code)
+    6 -> do  -- RSP_WORKER_RESERVED
+      wid <- peekW32 buf 4
+      return (RspWorkerReserved wid)
     _ -> ioError (userError $ "recvResponse: unknown response type " ++ show rtype)

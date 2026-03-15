@@ -45,6 +45,7 @@ struct worker_state {
     int code_fd;                /* memfd for code region, -1 if not used */
     struct ring_buffer *ring;   /* mmap'd in fork server too, for monitoring */
     int busy;
+    int reserved;               /* reserved by prepare(), excluded from auto-select */
 };
 
 /* ── Globals ─────────────────────────────────────────────────────────── */
@@ -296,7 +297,7 @@ static int spawn_worker(int idx)
 static int find_idle_worker(void)
 {
     for (int i = 0; i < pool_size; i++) {
-        if (!workers[i].busy && workers[i].pid > 0) {
+        if (!workers[i].busy && !workers[i].reserved && workers[i].pid > 0) {
             uint32_t st = atomic_load_explicit(&workers[i].ring->status,
                                                 memory_order_acquire);
             if (st == WORKER_READY || st == WORKER_DONE)
@@ -366,6 +367,15 @@ static void handle_dispatch(const struct command *cmd)
     w->ring->code_len = (uint32_t)code_len;
     w->busy = 1;
 
+    wake_and_wait(idx);
+}
+
+/* ── Wake worker and wait for completion ──────────────────────────────── */
+
+static void wake_and_wait(int idx)
+{
+    struct worker_state *w = &workers[idx];
+
     /* Signal worker to run */
     atomic_store_explicit(&w->ring->control, WORKER_RUN,
                           memory_order_release);
@@ -378,7 +388,7 @@ static void handle_dispatch(const struct command *cmd)
         if (st == WORKER_DONE)
             break;
         if (st == WORKER_CRASHED || w->pid <= 0) {
-            goto worker_crashed;
+            goto crashed;
         }
         /* Check if worker process has exited (kill returns 0 for zombies) */
         {
@@ -386,7 +396,7 @@ static void handle_dispatch(const struct command *cmd)
             long wret = sys_call4(61 /*__NR_wait4*/, (long)w->pid,
                                   (long)&wstatus, 1 /*WNOHANG*/, 0L);
             if (wret > 0 || wret == -10 /*ECHILD*/) {
-                goto worker_crashed;
+                goto crashed;
             }
         }
         /* Wait on notify futex with timeout (100ms) to recheck liveness */
@@ -398,9 +408,35 @@ static void handle_dispatch(const struct command *cmd)
                       &ts, 0, 0);
         }
     }
-    goto worker_done;
 
-worker_crashed:
+    /* Reset notify */
+    atomic_store_explicit(&w->ring->notify, 0, memory_order_release);
+    w->busy = 0;
+
+    /* Send result */
+    {
+        struct response rsp;
+        simple_memset(&rsp, 0, sizeof(rsp));
+        rsp.type = RSP_WORKER_DONE;
+        rsp.worker_done.worker_id = (uint32_t)idx;
+        rsp.worker_done.exit_code = w->ring->exit_code;
+        rsp.worker_done.result_size = w->ring->result_size;
+
+        if (w->ring->result_size > 0) {
+            send_response_with_data(&rsp,
+                                    w->ring->data + w->ring->result_offset,
+                                    w->ring->result_size);
+        } else {
+            send_response(&rsp);
+        }
+    }
+
+    /* Reset worker status for next dispatch */
+    atomic_store_explicit(&w->ring->status, WORKER_READY,
+                          memory_order_release);
+    return;
+
+crashed:
     {
         struct response rsp;
         simple_memset(&rsp, 0, sizeof(rsp));
@@ -409,35 +445,68 @@ worker_crashed:
         rsp.worker_crashed.signal = 0;
         send_response(&rsp);
         w->busy = 0;
+        w->reserved = 0;
         w->pid = 0;
+    }
+}
+
+/* ── Handle run command (re-run pre-loaded code) ─────────────────────── */
+
+static void handle_run(const struct command *cmd)
+{
+    int idx = (int)cmd->run.worker_id;
+    if (idx < 0 || idx >= pool_size || workers[idx].pid <= 0) {
+        struct response rsp;
+        simple_memset(&rsp, 0, sizeof(rsp));
+        rsp.type = RSP_ERROR;
+        rsp.error.code = -1;
+        send_response(&rsp);
         return;
     }
-worker_done:
-    (void)0;
 
-    /* Reset notify */
-    atomic_store_explicit(&w->ring->notify, 0, memory_order_release);
-    w->busy = 0;
+    workers[idx].busy = 1;
+    wake_and_wait(idx);
+}
 
-    /* Send result */
-    struct response rsp;
-    simple_memset(&rsp, 0, sizeof(rsp));
-    rsp.type = RSP_WORKER_DONE;
-    rsp.worker_done.worker_id = (uint32_t)idx;
-    rsp.worker_done.exit_code = w->ring->exit_code;
-    rsp.worker_done.result_size = w->ring->result_size;
+/* ── Handle reserve command ──────────────────────────────────────────── */
 
-    if (w->ring->result_size > 0) {
-        send_response_with_data(&rsp,
-                                w->ring->data + w->ring->result_offset,
-                                w->ring->result_size);
+static void handle_reserve(const struct command *cmd)
+{
+    int idx;
+    uint32_t wid = cmd->reserve_release.worker_id;
+
+    if (wid == (uint32_t)-1) {
+        idx = find_idle_worker();
     } else {
-        send_response(&rsp);
+        idx = (int)wid;
+        if (idx < 0 || idx >= pool_size || workers[idx].pid <= 0)
+            idx = -1;
     }
 
-    /* Reset worker status for next dispatch */
-    atomic_store_explicit(&w->ring->status, WORKER_READY,
-                          memory_order_release);
+    struct response rsp;
+    simple_memset(&rsp, 0, sizeof(rsp));
+
+    if (idx < 0) {
+        rsp.type = RSP_ERROR;
+        rsp.error.code = -1;
+        send_response(&rsp);
+        return;
+    }
+
+    workers[idx].reserved = 1;
+    rsp.type = RSP_WORKER_RESERVED;
+    rsp.worker_reserved.worker_id = (uint32_t)idx;
+    send_response(&rsp);
+}
+
+/* ── Handle release command ──────────────────────────────────────────── */
+
+static void handle_release(const struct command *cmd)
+{
+    int idx = (int)cmd->reserve_release.worker_id;
+    if (idx >= 0 && idx < pool_size) {
+        workers[idx].reserved = 0;
+    }
 }
 
 /* ── Handle status command ───────────────────────────────────────────── */
@@ -563,6 +632,15 @@ static void __attribute__((noreturn)) fork_server_main(void)
                 switch (cmd.type) {
                 case CMD_DISPATCH:
                     handle_dispatch(&cmd);
+                    break;
+                case CMD_RUN:
+                    handle_run(&cmd);
+                    break;
+                case CMD_RESERVE:
+                    handle_reserve(&cmd);
+                    break;
+                case CMD_RELEASE:
+                    handle_release(&cmd);
                     break;
                 case CMD_STATUS:
                     handle_status();
