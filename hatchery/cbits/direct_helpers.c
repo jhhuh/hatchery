@@ -80,7 +80,11 @@ int hatchery_wait_worker(void *ring_base, int worker_pid, int *out_exit_code)
             return 0;
         }
 
-        /* Check if worker is still alive */
+        /* Fork server writes WORKER_CRASHED to status on worker death */
+        if (st == WORKER_CRASHED)
+            return -1;
+
+        /* Fallback: check if worker is still alive */
         if (kill(worker_pid, 0) < 0)
             return -1;
 

@@ -3,6 +3,7 @@ module Main where
 import Hatchery
 import qualified Data.ByteString as BS
 import System.CPUTime
+import System.IO (hSetBuffering, stdout, BufferMode(..))
 import Text.Printf (printf)
 import PrimBaseline (primReturn42)
 
@@ -27,6 +28,7 @@ timeN n act = do
 
 main :: IO ()
 main = do
+  hSetBuffering stdout LineBuffering
   let n = 100000
 
   putStrLn "=== return42 Dispatch Latency ==="
@@ -44,15 +46,22 @@ main = do
 
   -- Hatchery
   let hn = 100000
+
+  -- One-shot dispatch (futex wake/wait)
   withHatchery defaultConfig { poolSize = 1 } $ \h -> do
     -- warmup
     mapM_ (\_ -> dispatch h UseSharedMemfd payload) [1..10 :: Int]
 
-    avgMemfd <- timeN hn (dispatch h UseSharedMemfd payload)
-    printf "  hatchery (memfd):     %8.1f ns/call  (%d calls)\n" avgMemfd hn
+    avgDisp <- timeN hn (dispatch h UseSharedMemfd payload)
+    printf "  hatchery (dispatch):  %8.1f ns/call  (%d calls)\n" avgDisp hn
 
-    avgVmw <- timeN hn (dispatch h UseProcessVmWritev payload)
-    printf "  hatchery (vm_writev): %8.1f ns/call  (%d calls)\n" avgVmw hn
+  -- One-shot dispatch with spin-wait on Haskell side
+  let spinDispCfg = defaultConfig { poolSize = 1, waitStrategy = SpinWait 10000 }
+  withHatchery spinDispCfg $ \h -> do
+    mapM_ (\_ -> dispatch h UseSharedMemfd payload) [1..10 :: Int]
+
+    avgSpinDisp <- timeN hn (dispatch h UseSharedMemfd payload)
+    printf "  hatchery (dispatch spin): %5.1f ns/call  (%d calls)\n" avgSpinDisp hn
 
   -- Pre-loaded payload (no re-injection)
   withHatchery defaultConfig { poolSize = 2 } $ \h -> do
