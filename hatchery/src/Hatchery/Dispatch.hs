@@ -12,17 +12,21 @@ module Hatchery.Dispatch
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Internal as BSI
 import Data.Int
+import Data.IORef
 import Data.Word
+import Control.Concurrent.MVar
 import Control.Exception (throwIO, Exception, bracket)
 import Control.Monad (when)
 import Foreign.Ptr
+import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Storable (peek)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.C.Types
 
 import Hatchery.Config (InjectionCapability(..), InjectionMethod(..), HatcheryConfig(..), WaitStrategy(..))
-import Hatchery.Core (Hatchery(..))
+import Hatchery.Core (Hatchery(..), WorkerMapping(..))
 import Hatchery.Internal.Protocol
 import Hatchery.Internal.SpinWait (spinWait)
 
@@ -88,6 +92,9 @@ foreign import ccall "hatchery_set_spin_mode"
 foreign import ccall safe "hatchery_futex_wait_safe"
   c_futex_wait_safe :: Ptr () -> IO CInt
 
+foreign import ccall "hatchery_write_code"
+  c_write_code :: Ptr () -> Ptr () -> Ptr Word8 -> Word32 -> IO ()
+
 foreign import ccall "close"
   c_close :: CInt -> IO CInt
 
@@ -117,26 +124,130 @@ handleResponse h = do
         else throwIO HatcheryDead
     _ -> ioError (userError $ "dispatch: unexpected response: " ++ show rsp)
 
--- | Dispatch code to a worker.
+-- | Take an idle worker from the pool. Returns Nothing if none available.
+takeWorker :: MVar [Word32] -> IO (Maybe Word32)
+takeWorker mv = do
+  ws <- takeMVar mv
+  case ws of
+    []     -> putMVar mv [] >> return Nothing
+    (w:rest) -> putMVar mv rest >> return (Just w)
+
+-- | Return a worker to the idle pool.
+putWorker :: MVar [Word32] -> Word32 -> IO ()
+putWorker mv wid = do
+  ws <- takeMVar mv
+  putMVar mv (wid : ws)
+
+-- | Find a worker mapping by ID.
+findWorker :: IORef [WorkerMapping] -> Word32 -> IO WorkerMapping
+findWorker ref wid = do
+  ws <- readIORef ref
+  case filter (\w -> wmWorkerId w == wid) ws of
+    (w:_) -> return w
+    []    -> ioError (userError $ "findWorker: unknown worker " ++ show wid)
+
+-- | Core wake+wait logic shared by dispatch and run.
+runDirect :: Hatchery -> Ptr () -> Int -> IO DispatchResult
+runDirect h ringPtr workerPid = do
+  case waitStrategy (hConfig h) of
+    FutexWait   -> c_wake_worker ringPtr >> waitFutex ringPtr workerPid
+    SpinWait n  -> c_wake_worker_spin ringPtr >> waitSpin ringPtr n
+    SpinWaitC n -> c_wake_worker_spin ringPtr >> waitSpinC ringPtr n
+
+-- | Futex-based wait.
+waitFutex :: Ptr () -> Int -> IO DispatchResult
+waitFutex ringPtr workerPid =
+  alloca $ \ecPtr -> do
+    ret <- c_wait_worker ringPtr (fromIntegral workerPid) ecPtr
+    if ret == 0
+      then readResult ringPtr ecPtr
+      else return $ Crashed 0
+
+-- | Spin-wait with futex fallback (Cmm via inline-cmm).
+waitSpin :: Ptr () -> Word32 -> IO DispatchResult
+waitSpin ringPtr n = go
+  where
+    go = case spinWait ringPtr n of
+      (0, ec) -> do
+        rsz <- c_result_size ringPtr
+        if rsz > 0
+          then do
+            dataPtr <- c_result_data ringPtr
+            bs <- BS.packCStringLen (castPtr dataPtr, fromIntegral rsz)
+            return $ Completed (fromIntegral ec) (Just bs)
+          else return $ Completed (fromIntegral ec) Nothing
+      (1, _) -> return $ Crashed 0
+      _      -> do
+        _ <- c_futex_wait_safe ringPtr
+        go
+
+-- | Spin-wait with futex fallback (C, atomics inlined by GCC).
+waitSpinC :: Ptr () -> Word32 -> IO DispatchResult
+waitSpinC ringPtr n = alloca $ \ecPtr -> go ecPtr
+  where
+    go ecPtr = do
+      ret <- c_spin_wait ringPtr n ecPtr
+      case ret of
+        0 -> do
+          ec <- peek ecPtr
+          rsz <- c_result_size ringPtr
+          if rsz > 0
+            then do
+              dataPtr <- c_result_data ringPtr
+              bs <- BS.packCStringLen (castPtr dataPtr, fromIntegral rsz)
+              return $ Completed ec (Just bs)
+            else return $ Completed ec Nothing
+        1 -> return $ Crashed 0
+        _ -> do
+          _ <- c_futex_wait_safe ringPtr
+          go ecPtr
+
+-- | Read result after successful futex wait.
+readResult :: Ptr () -> Ptr Int32 -> IO DispatchResult
+readResult ringPtr ecPtr = do
+  ec <- peek ecPtr
+  rsz <- c_result_size ringPtr
+  if rsz > 0
+    then do
+      dataPtr <- c_result_data ringPtr
+      bs <- BS.packCStringLen (castPtr dataPtr, fromIntegral rsz)
+      return $ Completed ec (Just bs)
+    else return $ Completed ec Nothing
+
+-- | Dispatch code to a worker. Bypasses the fork server entirely:
+-- takes an idle worker, writes code directly to the mmap'd memfd,
+-- wakes the worker, and waits for completion.
 dispatch :: Hatchery -> InjectionMethod -> ByteString -> IO DispatchResult
-dispatch h method codeBytes = do
+dispatch h _method codeBytes = do
   let cap = injectionCapability (hConfig h)
-  if not (validateMethod cap method)
-    then throwIO IncompatibleInjectionMethod
-    else do
-      let cmd = CmdDispatch
-            (DispatchCmd
-              { dcWorkerId = maxBound  -- auto-select
-              , dcInjectionMethod = methodToWire method
-              , dcCodeLen = fromIntegral (BS.length codeBytes)
-              })
-            codeBytes
-      sendCommand (hSockFd h) cmd
-      handleResponse h
+  when (cap == ProcessVmWritevOnly) $
+    throwIO IncompatibleInjectionMethod
+
+  mwid <- takeWorker (hIdleWorkers h)
+  wid <- case mwid of
+    Nothing -> throwIO NoAvailableWorker
+    Just w  -> return w
+
+  wm <- findWorker (hWorkerInfo h) wid
+
+  -- Write code directly to mmap'd memfd
+  let (fptr, off, len) = BSI.toForeignPtr codeBytes
+  withForeignPtr fptr $ \p ->
+    c_write_code (wmRingPtr wm) (wmCodePtr wm) (p `plusPtr` off) (fromIntegral len)
+
+  -- Wake and wait (same path as run)
+  result <- runDirect h (wmRingPtr wm) (wmWorkerPid wm)
+
+  -- Return worker to idle set (unless crashed)
+  case result of
+    Crashed _ -> return ()
+    _         -> putWorker (hIdleWorkers h) wid
+
+  return result
 
 -- | Reserve a worker, inject code, and run it once.
 -- The worker is reserved from the pool and can be re-run via 'run'.
--- The ring buffer is mmap'd for direct Haskell↔worker communication.
+-- The ring buffer is mmap'd into the Haskell process for direct access.
 prepare :: Hatchery -> InjectionMethod -> ByteString -> IO PreparedWorker
 prepare h method codeBytes = do
   let cap = injectionCapability (hConfig h)
@@ -206,71 +317,7 @@ prepare h method codeBytes = do
 -- | Re-run pre-loaded code on a prepared worker.
 -- Direct Haskell↔worker path: no socketpair, no fork server.
 run :: PreparedWorker -> IO DispatchResult
-run pw = do
-  case waitStrategy (hConfig (pwHatchery pw)) of
-    FutexWait   -> c_wake_worker (pwRingPtr pw) >> runFutex pw
-    SpinWait n  -> c_wake_worker_spin (pwRingPtr pw) >> runSpin pw n
-    SpinWaitC n -> c_wake_worker_spin (pwRingPtr pw) >> runSpinC pw n
-
--- | Original futex-based wait.
-runFutex :: PreparedWorker -> IO DispatchResult
-runFutex pw =
-  alloca $ \ecPtr -> do
-    ret <- c_wait_worker (pwRingPtr pw) (fromIntegral (pwWorkerPid pw)) ecPtr
-    if ret == 0
-      then readResult pw ecPtr
-      else return $ Crashed 0
-
--- | Spin-wait with futex fallback (Cmm via inline-cmm).
-runSpin :: PreparedWorker -> Word32 -> IO DispatchResult
-runSpin pw n = go
-  where
-    go = case spinWait (pwRingPtr pw) n of
-      (0, ec) -> do
-        rsz <- c_result_size (pwRingPtr pw)
-        if rsz > 0
-          then do
-            dataPtr <- c_result_data (pwRingPtr pw)
-            bs <- BS.packCStringLen (castPtr dataPtr, fromIntegral rsz)
-            return $ Completed (fromIntegral ec) (Just bs)
-          else return $ Completed (fromIntegral ec) Nothing
-      (1, _) -> return $ Crashed 0
-      _      -> do
-        _ <- c_futex_wait_safe (pwRingPtr pw)
-        go
-
--- | Spin-wait with futex fallback (C, atomics inlined by GCC).
-runSpinC :: PreparedWorker -> Word32 -> IO DispatchResult
-runSpinC pw n = alloca $ \ecPtr -> go ecPtr
-  where
-    go ecPtr = do
-      ret <- c_spin_wait (pwRingPtr pw) n ecPtr
-      case ret of
-        0 -> do
-          ec <- peek ecPtr
-          rsz <- c_result_size (pwRingPtr pw)
-          if rsz > 0
-            then do
-              dataPtr <- c_result_data (pwRingPtr pw)
-              bs <- BS.packCStringLen (castPtr dataPtr, fromIntegral rsz)
-              return $ Completed ec (Just bs)
-            else return $ Completed ec Nothing
-        1 -> return $ Crashed 0
-        _ -> do
-          _ <- c_futex_wait_safe (pwRingPtr pw)
-          go ecPtr
-
--- | Read result after successful futex wait.
-readResult :: PreparedWorker -> Ptr Int32 -> IO DispatchResult
-readResult pw ecPtr = do
-  ec <- peek ecPtr
-  rsz <- c_result_size (pwRingPtr pw)
-  if rsz > 0
-    then do
-      dataPtr <- c_result_data (pwRingPtr pw)
-      bs <- BS.packCStringLen (castPtr dataPtr, fromIntegral rsz)
-      return $ Completed ec (Just bs)
-    else return $ Completed ec Nothing
+run pw = runDirect (pwHatchery pw) (pwRingPtr pw) (pwWorkerPid pw)
 
 -- | Release a reserved worker back to the pool.
 release :: PreparedWorker -> IO ()
