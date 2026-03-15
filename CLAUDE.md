@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Phase 1 complete, Phase 2 partial. Core sandbox works end-to-end. Spin-wait mode for pre-loaded workers implemented (~350ns dispatch via inline-cmm Cmm spin loop, ~3100ns via futex, ~5500ns one-shot dispatch). LLVM integration stubbed (llvm-ffi build issue). See `artifacts/devlog.md` for history.
+Phase 1 complete, Phase 2 partial. Core sandbox works end-to-end. Fork server bypassed entirely on dispatch hot path — Haskell writes code directly to mmap'd memfd and wakes workers via ring buffer. One-shot dispatch: ~691ns (spin-wait) / ~3410ns (futex). Pre-loaded run: ~428ns (spin) / ~3162ns (futex). LLVM integration stubbed (llvm-ffi build issue). See `artifacts/devlog.md` for history.
 
 ## What This Is
 
@@ -56,30 +56,32 @@ The fork server ELF is compiled **at TH time** by `Hatchery.Internal.Compile`, w
 ## Architecture
 
 ```
-GHC Process → socketpair/pipe → Fork Server (static-PIE C, embedded in binary)
-                                   ├─► Worker 0 (spin/futex-suspended, seccomp-filtered)
-                                   ├─► Worker 1
-                                   └─► ...
+GHC Process ──mmap'd memfd──► Worker 0 (spin/futex-suspended, seccomp-filtered)
+     │                        Worker 1
+     │ socketpair/pipe         ...
+     └──► Fork Server         lifecycle only: spawn, crash detect, shutdown
 ```
 
-- **Fork server** (`cbits/fork_server.c`): Pure C, static-PIE ELF (musl), no libc, raw syscalls (`syscall.h`). Single-threaded epoll loop. Spawns workers via `fork()`. Entry point: `_start` (naked) → `real_start` (parses argc/argv for fd numbers and config).
+- **Fork server** (`cbits/fork_server.c`): Pure C, static-PIE ELF (musl), no libc, raw syscalls (`syscall.h`). Single-threaded epoll loop. Spawns workers via `fork()`. Not on the dispatch hot path — only handles lifecycle (spawn, crash detection via pidfd epoll, shutdown).
 - **Workers**: Own address space, PROT_RWX code region, MAP_SHARED ring buffer (memfd), seccomp filter. Execute injected machine code as `int fn(void)`.
-- **Communication**: socketpair for commands (`protocol.h` structs, 16-byte command / 20-byte response), ring buffer for data + synchronization. Futex or spin-wait for worker wake/notify. Ring buffer layout defined in `ring_buffer_layout.h`; field offsets generated at build time via `hsc2hs` (`RingOffsets.hsc`) and `offsetof()` (`direct_helpers.c`).
-- **Lifecycle**: Parent death → pipe EOF → fork server exits. Worker crash detected via pidfd epoll (fork server writes `WORKER_CRASHED` to ring buffer).
+- **Dispatch path**: At startup, all workers are reserved and their ring buffers + code memfds are mmap'd into Haskell. `dispatch` writes code directly to mmap'd memfd, sets `control=RUN` in ring buffer, waits via spin or futex. No socketpair on the hot path.
+- **Communication**: Ring buffer for control + synchronization (`ring_buffer_layout.h`). Socketpair used only at startup (CMD_RESERVE) and shutdown (CMD_SHUTDOWN). Field offsets generated at build time via `hsc2hs` (`RingOffsets.hsc`) and `offsetof()` (`direct_helpers.c`).
+- **Idle tracking**: `MVar [Word32]` on Haskell side. Workers taken/returned per dispatch.
+- **Lifecycle**: Parent death → pipe EOF → fork server exits. Worker crash detected via pidfd epoll (fork server writes `WORKER_CRASHED` to ring buffer status).
 - **Haskell spawn path**: `Core.withHatchery` → `Vfork.spawnForkServer` (FFI to `vfork_helper.c`) → `execveat` of the embedded ELF via memfd.
 
 ### Wire protocol
 
-Command/response are fixed-size C structs sent over the socketpair. Code bytes follow `CMD_DISPATCH` inline. `Hatchery.Internal.Protocol` must match `protocol.h` exactly (enum values, struct layouts, field offsets). The Haskell side uses manual `Ptr` arithmetic, not `Storable` instances for the protocol structs.
+Command/response are fixed-size C structs sent over the socketpair. Only used at startup (`CMD_RESERVE`) and shutdown (`CMD_SHUTDOWN`). `CMD_DISPATCH` exists in protocol but is no longer used by the default dispatch path. `Hatchery.Internal.Protocol` must match `protocol.h` exactly (enum values, struct layouts, field offsets).
 
-## Dual Injection Methods
+## Injection Capability
 
 Pool config (`InjectionCapability`) determines worker code region setup:
-- `ProcessVmWritevOnly` — MAP_PRIVATE|MAP_ANONYMOUS code region
+- `ProcessVmWritevOnly` — MAP_PRIVATE|MAP_ANONYMOUS code region. **`dispatch` not supported** (requires memfd). Use `prepare`/`run` only.
 - `SharedMemfdOnly` — MAP_SHARED from memfd
-- `BothMethods` — MAP_SHARED from memfd, either method per-dispatch
+- `BothMethods` — MAP_SHARED from memfd (default)
 
-Per-dispatch `InjectionMethod`: `UseProcessVmWritev | UseSharedMemfd`. Mismatch → error.
+`dispatch` always writes code directly to the mmap'd memfd. The `InjectionMethod` parameter is kept for API compatibility but ignored.
 
 ## Key Gotchas
 
@@ -89,5 +91,7 @@ Per-dispatch `InjectionMethod`: `UseProcessVmWritev | UseSharedMemfd`. Mismatch 
 - **4096-byte code buffer in fork_server.c** — limits injected code size (Phase 1 limitation)
 - **`-fno-stack-protector` required** — GCC 15 enables stack protector by default, but `-nostartfiles` binary has no TLS → segfault on `%fs:0x28` access
 - **`_start` must be `naked`** — GCC 15 adds prologue that corrupts RSP before inline asm can capture it
+- **`dispatch` always uses futex_wake** — workers may be in futex_wait between dispatches, so `dispatch` can't use spin-wake. The spin optimization is on the Haskell wait side only. `prepare`/`run` use spin-wake after the first successful futex-waked run.
+- **`dispatch` requires memfd capability** — `ProcessVmWritevOnly` config errors on `dispatch`. Use `SharedMemfdOnly` or `BothMethods` (default).
 - **No worker respawn yet** — crashed workers are marked dead, not replaced (Phase 2)
 - **No PID namespace yet** — fork server runs without CLONE_NEWPID (Phase 3)

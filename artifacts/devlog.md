@@ -228,36 +228,58 @@ Benchmark appeared to "hang" with `-threaded` and no explicit `-N` flag. Investi
 - GHC illustrated (HEC/Task/capability model): https://takenobu-hs.github.io/downloads/haskell_ghc_illustrated.pdf
 - `-keep-tmp-files` GHC flag to inspect `inline-cmm` generated `.cmm` files (but note: `inline-cmm` explicitly `removeFile`s the `.cmm` after compilation — would need to patch the library to keep them)
 
+## 2026-03-15 — Direct dispatch: fork server bypassed entirely
+
+### Design
+
+Went further than originally planned. Instead of just writing code to memfd and sending a lightweight command to the fork server, we removed the fork server from the dispatch path entirely:
+
+1. `withHatchery` reserves ALL workers via `CMD_RESERVE` at startup
+2. `pidfd_getfd` + `mmap` for each worker's ring buffer and code memfd
+3. Idle workers tracked by `MVar [Word32]` on the Haskell side
+4. `dispatch` = take idle worker → memcpy code to memfd → wake worker → wait → return to idle
+5. Fork server is now lifecycle-only: spawn workers, detect crashes via pidfd epoll, shutdown
+
+`prepare`/`run`/`release` also simplified: `prepare` takes from the same MVar pool, writes code, runs once, sets `spin_mode`. `release` returns to pool. `PreparedWorker` now wraps `WorkerMapping`.
+
+### Bugs found and fixed
+
+1. **MVar deadlock**: `newMVar []` in acquire + `putMVar` in `reserveAllWorkers` → deadlock. Fixed: `newEmptyMVar`.
+2. **spin_mode race**: Setting `spin_mode=1` at startup causes `c_wake_worker_spin` (no futex_wake) to miss workers that fell back to `futex_wait`. Fixed: `dispatch` always uses `c_wake_worker` (futex_wake). Only `prepare` sets `spin_mode` after a successful initial run. `run` uses spin-wake.
+3. **Crash detection hang**: `c_wait_worker` only checked for `WORKER_DONE`, not `WORKER_CRASHED`. Crashed workers (zombies) passed `kill(pid, 0)` check → infinite loop with 100ms futex timeout. Fixed: added `WORKER_CRASHED` status check.
+
+### Measured latency
+
+```
+foreign import prim:          0.3 ns
+unsafe ccall:                 1.3 ns
+safe ccall:                  72   ns
+hatchery (dispatch futex):  3410  ns   (direct memfd write + futex wake/wait)
+hatchery (dispatch spin):    691  ns   (direct memfd write + spin-wait)
+hatchery (pre-loaded):      3162  ns   (no code write, futex wake/wait)
+hatchery (spin-wait Cmm):    428  ns   (no code write, Cmm spin)
+hatchery (spin-wait C):      399  ns   (no code write, C spin)
+```
+
+**Before → After**:
+- dispatch (futex): ~5500ns → 3410ns (**-38%**)
+- dispatch (spin): N/A → 691ns (**new — 8x faster than old dispatch**)
+- pre-loaded/spin-wait: unchanged (same mechanism as before)
+
+### Interpretation
+
+**dispatch spin (691ns)**: The ~260ns gap over pre-loaded spin-wait (428ns) is the per-call memcpy + code_len write. This is the cost of code injection on a hot path — negligible for real workloads.
+
+**dispatch futex (3410ns)**: The ~250ns gap over pre-loaded futex (3162ns) is the same memcpy overhead. The big win vs old dispatch (~5500ns) is eliminating the fork server relay (two socketpair round-trips + code serialization).
+
+### What simplified
+
+- `Dispatch.hs`: 294 lines → 168 lines. Removed all fork-server protocol interaction (pidfd_getfd, mmap, CMD_RESERVE, CMD_DISPATCH, CMD_RELEASE).
+- `dispatch` and `prepare`/`run` now share the same underlying mechanism (`runDirect`).
+- Fork server no longer on the hot path.
+- `PreparedWorker` simplified: wraps `WorkerMapping` from pool (no separate mmap lifecycle).
+
 ## Next steps for following sessions
-
-### Next session: Direct memfd writes for `dispatch`
-
-**Goal**: Cut one-shot dispatch latency from ~6000ns to ~3000ns by writing code directly to the worker's memfd from Haskell, bypassing socketpair serialization.
-
-**Current path** (`dispatch`):
-```
-Haskell → [code bytes over socketpair] → Fork Server → [pwrite to code_fd] → Worker
-```
-Two socketpair round-trips (~1000ns) + fork server relay overhead.
-
-**New path**:
-```
-Haskell → [direct write to mmap'd code_fd] → [control signal over socketpair] → Fork Server → Worker
-```
-Haskell writes code directly to the memfd (already mmap'd in Haskell process for `prepare` path). Socketpair carries only the dispatch command (no inline code bytes). Fork server wakes the worker.
-
-**What exists**: The `prepare` path already does `pidfd_getfd` to duplicate the fork server's memfds into Haskell, then mmaps them. The plumbing is proven. The task is to make `dispatch` optionally use the same pattern — either eagerly (mmap at `withHatchery` time for all workers) or lazily (mmap on first dispatch to each worker).
-
-**Key decisions**:
-- Eager vs lazy mmap: eager is simpler (mmap all workers at startup), costs ~N×4KB virtual address space.
-- Wire protocol change: `CMD_DISPATCH` currently sends code bytes inline. New variant (or flag) tells fork server "code already written to memfd, just wake the worker."
-- API change: none. `dispatch` signature stays the same. The optimization is internal.
-
-**Files to modify**:
-- `direct_helpers.c`: add `hatchery_write_code` (memcpy to mmap'd code region)
-- `protocol.h` / `fork_server.c`: new command or flag for "code pre-written"
-- `Dispatch.hs`: `dispatch` writes to mmap'd memfd, sends lightweight command
-- `Core.hs`: mmap worker memfds at startup (eager path)
 
 ### Following sessions (Phase 2 completion)
 

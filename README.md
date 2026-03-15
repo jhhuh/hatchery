@@ -33,17 +33,17 @@ A minimal C supervisor (~750 lines, musl static-PIE, no libc) is embedded in the
 ### Measured latency (return 42 workload, 100k iterations)
 
 ```
-foreign import prim:       0.3 ns/call  (register shuffle, no stack frame)
-unsafe ccall:              1.4 ns/call  (C ABI overhead)
-safe ccall:               68   ns/call  (releases GHC capability)
-hatchery (spin-wait Cmm): 365  ns/call  (Cmm spin, no futex syscalls)
-hatchery (spin-wait C):   370  ns/call  (C spin, GCC-inlined atomics)
-hatchery (pre-loaded):   3100  ns/call  (direct futex wake/wait, no fork server)
-hatchery (vm_writev):    5500  ns/call  (code injection + fork server relay)
-hatchery (memfd):        5950  ns/call  (code injection + fork server relay)
+foreign import prim:          0.3 ns/call  (register shuffle, no stack frame)
+unsafe ccall:                 1.3 ns/call  (C ABI overhead)
+safe ccall:                  72   ns/call  (releases GHC capability)
+hatchery (dispatch spin):   691  ns/call  (direct memfd write + spin-wait)
+hatchery (dispatch futex): 3410  ns/call  (direct memfd write + futex wake/wait)
+hatchery (spin-wait Cmm):   428  ns/call  (pre-loaded, Cmm spin, no futex)
+hatchery (spin-wait C):     399  ns/call  (pre-loaded, C spin, GCC atomics)
+hatchery (pre-loaded):     3162  ns/call  (pre-loaded, futex wake/wait)
 ```
 
-Spin-wait (~365ns) without core pinning. Includes scheduler jitter and per-iteration ccall overhead in the spin loop.
+Without core pinning. Spin-wait numbers include scheduler jitter and per-iteration ccall overhead.
 Works with both `-threaded` and single-threaded GHC RTS.
 
 ## Quick start
@@ -130,16 +130,20 @@ The fork server binary is compiled at Template Haskell time via `$HATCHERY_CC` (
 
 | Mode | Latency | Use case |
 |---|---|---|
-| `dispatch` | ~5.5 μs | One-shot: inject code + execute + return result |
-| `prepare` / `run` | ~3.1 μs (futex) or ~365 ns (spin) | Pre-load code once, re-run many times |
+| `dispatch` (futex) | ~3.4 μs | One-shot: write code to memfd + execute + return result |
+| `dispatch` (spin) | ~691 ns | One-shot with spin-wait on Haskell side |
+| `prepare` / `run` (futex) | ~3.2 μs | Pre-load code once, re-run many times |
+| `prepare` / `run` (spin) | ~428 ns | Pre-loaded with spin-wait |
+
+All dispatch modes bypass the fork server. Code is written directly to the worker's mmap'd memfd from Haskell. The fork server only handles worker lifecycle (spawn, crash detection, shutdown).
 
 **Spin-wait** (`SpinWait N`): Worker and Haskell spin N iterations before falling back to futex. Eliminates syscalls on the hot path. Configurable via `waitStrategy` in `HatcheryConfig`.
 
 ## Status
 
-Phase 1 complete, Phase 2 partial. Core sandbox works end-to-end with both injection methods, crash detection, and spin-wait mode.
+Phase 1 complete, Phase 2 partial. Core sandbox works end-to-end with direct memfd dispatch, crash detection, and spin-wait mode.
 
-**Not yet implemented**: worker respawn on crash, PID namespace isolation (`CLONE_NEWPID`), dispatch timeout enforcement, LLVM codegen (stubbed), direct memfd writes for `dispatch` (would cut one-shot latency to ~3μs).
+**Not yet implemented**: worker respawn on crash, PID namespace isolation (`CLONE_NEWPID`), dispatch timeout enforcement, LLVM codegen (stubbed).
 
 ## License
 
