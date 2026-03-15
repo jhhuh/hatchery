@@ -1,6 +1,8 @@
-# hatchery
+# hatchery [WIP — redesigning from new foundations]
 
 Type-safe sandboxed computation via coalgebraic objects.
+
+> **Status**: This project is being rebuilt from scratch around a new type-theoretic foundation. The previous implementation (pool of pre-spawned worker processes with ~365ns spin-wait dispatch) is frozen on [`v1-worker-pool`](../../tree/v1-worker-pool). No source code on master yet — only the design document and README below.
 
 Hatchery models isolated execution as an **abstract computer**: you define a blueprint (an Egg), hatch it into a live mutable object, and interact with it through typed methods. The object is backed by process isolation, but the abstraction is general — the same Egg/Object interface can target different backends.
 

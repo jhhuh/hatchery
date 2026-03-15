@@ -1,7 +1,7 @@
 # Egg/Object Architecture — Payload-Agnostic Hatchery Redesign
 
 Date: 2026-03-15
-Status: Draft
+Status: WIP — design phase, no implementation yet
 
 ## Motivation
 
