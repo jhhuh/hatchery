@@ -4,59 +4,78 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Pre-implementation. `PLAN.md` is the authoritative design document — read it fully before any architectural decisions. No source code exists yet.
+Phase 1 complete. Core sandbox works end-to-end (spawn → dispatch → result). LLVM integration stubbed (llvm-ffi build issue). See `artifacts/devlog.md` for known issues and history.
 
 ## What This Is
 
-**hatchery** — A Linux process sandbox toolkit for Haskell. Manages a supervised pool of pre-spawned worker processes with microsecond dispatch latency. Workers are address-space-isolated, seccomp-filtered, and contained in a PID namespace.
+**hatchery** — Linux process sandbox toolkit for Haskell. Pre-spawned worker pool with microsecond dispatch. Workers are address-space-isolated, seccomp-filtered.
 
-**trustless-ffi** — Ergonomic wrapper over hatchery that makes foreign code execution feel like a normal FFI call, with the guarantee that crashes/hangs/wild writes can't propagate to the host.
+**hatchery-llvm** — Bridge: hatchery + llvm-tf. LLVM IR → machine code. Currently a stub.
 
-## Architecture (must-know)
+**trustless-ffi** — Ergonomic wrapper. Foreign code can't crash your program.
+
+## Build Commands
+
+```bash
+# Build fork server (must run before cabal build)
+nix develop -c make -C hatchery/cbits
+
+# Build all Haskell packages
+nix develop -c cabal build all
+
+# Run integration test (requires fork server built first)
+nix develop -c cabal test hatchery-test
+
+# Assemble test payloads
+nix develop -c nasm -f bin -o hatchery/test-payloads/return42.bin hatchery/test-payloads/return42.asm
+
+# Clean fork server binary
+nix develop -c make -C hatchery/cbits clean
+```
+
+The fork server binary (`hatchery/cbits/fork_server`) must exist before `cabal build hatchery` — it's embedded via Template Haskell (`file-embed`).
+
+## Architecture
 
 ```
-GHC Process → socketpair/pipe → Fork Server (static-PIE C, PID 1 in CLONE_NEWPID)
+GHC Process → socketpair/pipe → Fork Server (static-PIE C, embedded in binary)
                                    ├─► Worker 0 (futex-suspended, seccomp-filtered)
                                    ├─► Worker 1
                                    └─► ...
 ```
 
-- **Fork server**: Pure C, static-PIE ELF (musl, no libc dependency), embedded in Haskell binary via `file-embed`. Single-threaded, epoll-based. Spawns workers via `fork()` (not separate ELFs).
-- **Workers**: Own address space, PROT_RWX code region, MAP_SHARED ring buffer (memfd), seccomp filter. Wake via futex, execute injected machine code, report via ring buffer.
-- **Communication**: socketpair for control (commands/responses), shared ring buffer for bulk data (code bytes, results). ~3-5μs dispatch latency.
-- **Lifecycle**: Haskell dies → pipe EOF → fork server exits → PID namespace kills all workers. Worker crash → waitpid → respawn.
+- **Fork server** (`cbits/fork_server.c`): Pure C, static-PIE ELF (musl), single-threaded epoll loop. Spawns workers via `fork()`.
+- **Workers**: Own address space, PROT_RWX code region, MAP_SHARED ring buffer (memfd), seccomp filter. Execute injected machine code as `int fn(void)`.
+- **Communication**: socketpair for control, ring buffer for data. Futex for synchronization.
+- **Lifecycle**: Parent death → pipe EOF → fork server exits. Worker crash detected via pidfd + `kill(pid, 0)` liveness check.
 
-## Two-Package Layout
+## Package Layout
 
 ```
-hatchery/          Core sandbox primitives (Haskell library + C fork server)
-  src/             Haskell: Hatchery.{Config,Core,Dispatch}, Internal.{Memfd,Vfork,Protocol,Embedded}
-  cbits/           C: fork_server.c, worker_template.c, protocol.h, ring_buffer.h, seccomp_filter.c, syscall.h, vfork_helper.c
-trustless-ffi/     User-facing FFI wrapper (Haskell only, depends on hatchery)
+hatchery/          Core sandbox (Haskell library + C fork server)
+  src/             Hatchery.{Config,Core,Dispatch}, Internal.{Memfd,Vfork,Protocol,Embedded}
+  cbits/           fork_server.c, syscall.h, ring_buffer.h, protocol.h, seccomp_filter.{c,h}, vfork_helper.c
+  test/            Integration test
+  test-payloads/   Assembly test payloads (.asm → .bin)
+hatchery-llvm/     LLVM bridge (stub)
+trustless-ffi/     User-facing API
   src/             TrustlessFFI, TrustlessFFI.Marshal
 ```
 
-## Build System
+## Dual Injection Methods
 
-- C components: `musl-gcc -static-pie -nostartfiles -fPIE -Os` (see `hatchery/cbits/Makefile`)
-- Haskell: Cabal 3.0, multi-package. `hatchery.cabal` includes `cbits/vfork_helper.c` as c-sources
-- Fork server ELF embedded via Template Haskell (`file-embed`)
-- Nix flake required (per project rules). C build should be a Nix derivation
+Pool config (`InjectionCapability`) determines worker code region setup:
+- `ProcessVmWritevOnly` — MAP_PRIVATE|MAP_ANONYMOUS code region
+- `SharedMemfdOnly` — MAP_SHARED from memfd
+- `BothMethods` — MAP_SHARED from memfd, either method per-dispatch
 
-## Platform Requirements
+Per-dispatch `InjectionMethod`: `UseProcessVmWritev | UseSharedMemfd`. Mismatch → error.
 
-- Linux only (x86_64 initially)
-- Kernel ≥ 5.9 for unprivileged `CLONE_NEWPID + CLONE_NEWUSER` via clone3
-- Kernel ≥ 5.3 for `pidfd_open`
-- Kernel ≥ 3.17 for `memfd_create`
+## Key Gotchas
 
-## Implementation Order
-
-Follow the phased plan in `PLAN.md`. Phase 1 (minimal viable path) builds bottom-up: syscall wrappers → ring buffer → protocol → worker → fork server → Haskell FFI bindings → Core → Dispatch.
-
-## Key Design Constraints
-
-- Fork server and workers are **pure C** — no GHC RTS, no Haskell heap
-- `withHatchery` must be called from a **bound thread** (enforced at runtime)
-- Workers execute **raw machine code** at a known base address (not ELF, not relocatable)
-- Fork server uses `fork()` for workers (not vfork+execveat) — it's small enough that page table cost is negligible
+- **PR_SET_DUMPABLE=0 blocks process_vm_writev** — intentionally omitted from workers
+- **Fork server binary must exist before `cabal build`** — Template Haskell embeds it
+- **`withHatchery` requires bound thread** — use `-threaded` GHC flag, call from main or `forkOS`
+- **4096-byte code buffer in fork_server.c** — limits injected code size (Phase 1 limitation)
+- **No worker respawn yet** — crashed workers are marked dead, not replaced (Phase 2)
+- **No PID namespace yet** — fork server runs without CLONE_NEWPID (Phase 3)
