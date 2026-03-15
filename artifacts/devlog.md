@@ -160,9 +160,11 @@ This is at the hardware floor — you can't communicate between two processes fa
 **memfd vs vm_writev (6231 vs 5561ns)**: Similar magnitude, noise-level difference for small payloads (6 bytes). Both involve a kernel write path. Larger payloads would favor memfd (no per-page cross-process table walk).
 
 ### Known issues
-- **ccall overhead in Cmm spin loop**: Each poll iteration calls `hatchery_atomic_read32` via ccall (cross-compilation-unit, no inlining). On x86 where seq_cst loads are free MOVs, the ccall overhead dominates the per-iteration cost. Could be eliminated with GHC Cmm inline asm or by using `%acquire W_[addr]` with masking.
+- **Hardcoded ring buffer offsets**: `direct_helpers.c` and Cmm code have hardcoded byte offsets (e.g. `RING_STATUS_OFF 128`, `exit_code` at 164). Fragile — adding/reordering fields requires manual offset recalculation. Should migrate to `.hsc` or generate offsets from `ring_buffer.h`.
+- **ccall overhead in Cmm spin loop**: Each poll iteration calls `hatchery_atomic_read32` via ccall (cross-compilation-unit, no inlining). On x86 where seq_cst loads are free MOVs, the ccall overhead dominates the per-iteration cost.
 - **x86_64 only**: Cmm spin uses seq_cst via C wrappers. ARM would need different treatment.
 - **`dispatch` still serializes through socketpair**: Unchanged from before.
+- **No core pinning in benchmarks**: ~370ns may include scheduler jitter. `taskset` pinning to same-socket cores could reveal lower floor.
 
 ## Next steps for following sessions
 
