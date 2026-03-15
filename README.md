@@ -43,7 +43,7 @@ hatchery (vm_writev):    5500  ns/call  (code injection + fork server relay)
 hatchery (memfd):        5950  ns/call  (code injection + fork server relay)
 ```
 
-Spin-wait (~365ns) is at the hardware floor — two cross-process cache-line round-trips.
+Spin-wait (~365ns) without core pinning. Includes scheduler jitter and per-iteration ccall overhead in the spin loop.
 Works with both `-threaded` and single-threaded GHC RTS.
 
 ## Quick start

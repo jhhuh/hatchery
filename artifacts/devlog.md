@@ -137,7 +137,7 @@ hatchery (memfd):        6231  ns   (code injection + fork server relay)
 ```
 
 Two spin-wait implementations available (`SpinWait` = Cmm, `SpinWaitC` = C).
-Both hit ~350-400ns — the cross-process cache-line round-trip floor.
+Both hit ~350-400ns without core pinning. Likely includes scheduler jitter and per-iteration ccall overhead.
 
 ### Interpretation
 
@@ -146,10 +146,12 @@ Both hit ~350-400ns — the cross-process cache-line round-trip floor.
 **safe ccall (67ns)**: The safe FFI releases the GHC capability before entering C, allowing other Haskell threads and the GC to run. Re-acquiring the capability on return involves an atomic CAS + potential scheduler interaction. The ~66ns gap over unsafe is the cost of capability release/reacquire.
 
 **spin-wait (349ns)**: Zero syscalls on the hot path. The ~350ns is:
-- Cross-process cache-line round-trip: Haskell writes `control` (core A) → worker reads it (core B) → worker writes `status` (core B) → Haskell reads it (core A). Two cache-line invalidation round-trips at ~100-150ns each on modern Intel.
+- Cross-process cache-line round-trip: Haskell writes `control` (core A) → worker reads it (core B) → worker writes `status` (core B) → Haskell reads it (core A). Two cache-line invalidation round-trips at ~40-80ns each on modern Intel (intra-socket), so the theoretical floor is ~80-160ns.
 - Haskell-side overhead: prim call/return (Cmm) or unsafe ccall entry/exit (C), plus the seq_cst atomic reads in the spin loop. A few iterations execute before the worker's status write becomes visible.
+- No core pinning (`taskset`): OS scheduler may place processes on suboptimal cores or migrate them mid-run, adding jitter.
+- Per-iteration ccall: each spin poll calls `hatchery_atomic_read32` via ccall (cross-compilation-unit, no inlining), which dominates per-iteration cost on x86 where seq_cst loads are plain MOVs.
 
-This is at the hardware floor — you can't communicate between two processes faster than 2 cache-line round-trips.
+The ~350ns includes significant overhead beyond the cache-coherency floor. Core pinning and eliminating the ccall per spin iteration would likely bring this closer to the ~100-160ns theoretical minimum.
 
 **Cmm (349ns) vs C (391ns)**: The Cmm path is ~40ns faster. `foreign import prim` avoids the C ABI transition on every `run` call. The C spin loop itself is tighter (GCC inlines the atomics), but the entry/exit overhead of `unsafe ccall` slightly outweighs this.
 
