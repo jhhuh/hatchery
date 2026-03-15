@@ -200,6 +200,10 @@ hatchery (vm_writev):    5515  ns
 hatchery (memfd):        5949  ns
 ```
 
+### Note: benchmark timing with -threaded RTS
+
+Investigated apparent "hang" with `-threaded` and no explicit `-N` flag. After thorough strace analysis and GHC RTS threading model review (Marlow's concurrency FFI paper, GHC manual), the conclusion was simple: the benchmark takes ~15s total, and the test timeout was 10s. All RTS configurations complete correctly — no deadlock, no scheduler starvation. Explicit `+RTS -N1` is fastest for this single-threaded workload (~8s); `-N` (all cores) adds scheduler overhead (~15s).
+
 ## Next steps for following sessions
 
 ### Next session: Direct memfd writes for `dispatch`
