@@ -3,7 +3,10 @@ module Hatchery.Config
   , defaultConfig
   , InjectionCapability(..)
   , InjectionMethod(..)
+  , WaitStrategy(..)
   ) where
+
+import Data.Word (Word32)
 
 -- | Pool-level injection capability determines how workers set up their code regions.
 data InjectionCapability
@@ -18,6 +21,12 @@ data InjectionMethod
   | UseSharedMemfd       -- ^ Write code to shared memfd, worker sees via mapping.
   deriving (Show, Eq)
 
+-- | Wait strategy for pre-loaded worker dispatch ('prepare'/'run').
+data WaitStrategy
+  = FutexWait           -- ^ Pure futex wake\/wait (default, current behavior).
+  | SpinWait !Word32    -- ^ Spin N iterations, then fall back to futex.
+  deriving (Show, Eq)
+
 -- | Configuration for a hatchery worker pool.
 data HatcheryConfig = HatcheryConfig
   { poolSize            :: !Int    -- ^ Number of pre-spawned workers (default: 4)
@@ -25,6 +34,7 @@ data HatcheryConfig = HatcheryConfig
   , ringBufSize         :: !Word   -- ^ Shared ring buffer per worker in bytes (default: 1MB)
   , injectionCapability :: !InjectionCapability  -- ^ Pool-level injection capability (default: BothMethods)
   , dispatchTimeout     :: !(Maybe Double)  -- ^ Per-dispatch timeout in seconds (default: Nothing)
+  , waitStrategy        :: !WaitStrategy    -- ^ Wait strategy for pre-loaded dispatch (default: FutexWait)
   } deriving (Show, Eq)
 
 -- | Sensible defaults: 4 workers, 4MB code region, 1MB ring buffer, both injection methods.
@@ -35,4 +45,5 @@ defaultConfig = HatcheryConfig
   , ringBufSize         = 1024 * 1024
   , injectionCapability = BothMethods
   , dispatchTimeout     = Nothing
+  , waitStrategy        = FutexWait
   }

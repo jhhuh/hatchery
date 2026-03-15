@@ -6,6 +6,7 @@ module Hatchery
   , defaultConfig
   , InjectionCapability(..)
   , InjectionMethod(..)
+  , WaitStrategy(..)
     -- * Dispatch
   , dispatch
   , DispatchResult(..)
