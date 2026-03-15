@@ -515,9 +515,7 @@ static void handle_reserve(const struct command *cmd)
 
     workers[idx].reserved = 1;
 
-    /* Remove worker's pidfd from epoll — Haskell owns crash detection now */
-    if (workers[idx].pidfd >= 0)
-        sys_epoll_ctl(epfd, 2 /*EPOLL_CTL_DEL*/, workers[idx].pidfd, 0);
+    /* Keep pidfd in epoll — fork server writes CRASHED to ring on death */
 
     /* Temporarily set dumpable so Haskell can pidfd_getfd our memfds */
     sys_prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
@@ -538,14 +536,7 @@ static void handle_release(const struct command *cmd)
     int idx = (int)cmd->reserve_release.worker_id;
     if (idx >= 0 && idx < pool_size) {
         workers[idx].reserved = 0;
-
-        /* Re-add worker's pidfd to epoll */
-        if (workers[idx].pidfd >= 0) {
-            struct epoll_event ev;
-            ev.events = EPOLLIN;
-            ev.data.fd = workers[idx].pidfd;
-            sys_epoll_ctl(epfd, 1 /*EPOLL_CTL_ADD*/, workers[idx].pidfd, &ev);
-        }
+        /* pidfd already in epoll — no re-add needed */
     }
 }
 
@@ -575,19 +566,26 @@ static void handle_worker_death(int pidfd)
 {
     for (int i = 0; i < pool_size; i++) {
         if (workers[i].pidfd == pidfd) {
-            struct response rsp;
-            simple_memset(&rsp, 0, sizeof(rsp));
-            rsp.type = RSP_WORKER_CRASHED;
-            rsp.worker_crashed.worker_id = (uint32_t)i;
-            rsp.worker_crashed.signal = SIGKILL;  /* approximate */
-            send_response(&rsp);
+            /* Write CRASHED to ring buffer (Haskell spin loop sees this) */
+            atomic_store_explicit(&workers[i].ring->status,
+                                  WORKER_CRASHED, memory_order_release);
+            /* Wake Haskell if in futex fallback */
+            futex_wake(&workers[i].ring->notify, 1);
+
+            /* Only send socketpair response for non-reserved workers */
+            if (!workers[i].reserved) {
+                struct response rsp;
+                simple_memset(&rsp, 0, sizeof(rsp));
+                rsp.type = RSP_WORKER_CRASHED;
+                rsp.worker_crashed.worker_id = (uint32_t)i;
+                rsp.worker_crashed.signal = SIGKILL;
+                send_response(&rsp);
+            }
 
             sys_close(workers[i].pidfd);
             workers[i].pidfd = -1;
             workers[i].pid = 0;
             workers[i].busy = 0;
-            atomic_store_explicit(&workers[i].ring->status,
-                                  WORKER_CRASHED, memory_order_release);
             return;
         }
     }
