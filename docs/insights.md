@@ -1,82 +1,63 @@
-# Design Insights & Reasoning Chains
+# How We Got Here
 
-These are the insights, rejected alternatives, and reasoning chains from the design session that produced the Egg/Object architecture. Not structured as a spec — structured as a thinking trail for future sessions.
+Notes from the design session that produced the Egg/Object architecture. Written as a conversation trail — the way things actually unfolded, not the cleaned-up version.
 
-## The Starting Problem
+## It Started with Frustration
 
-Hatchery v1 baked too much into the core. Workers executed `int fn(void)` — no arguments, no structured I/O. The ring buffer had hardcoded fields (exit_code, result bytes). The only axis of variation was injection method (process_vm_writev vs memfd). Everything about "what does the payload look like" and "how do I pass input and read output" was left to the consumer with no abstraction.
+We'd built a working sandbox. Fork server, spin-wait at 365ns, the whole thing. It worked. But something was wrong at the level of the abstractions.
 
-The core insight: **hatchery should be payload-agnostic**. A specific strategy of handling input and output should be addressed at a higher abstraction. But the low-level library should "open the hatch" for such possibilities.
+The user put it plainly: "hatchery needs to be more payload agnostic, but we put too much of design's in that level." The v1 API had `dispatch :: Hatchery -> InjectionMethod -> ByteString -> IO DispatchResult` — you shoved raw machine code in, you got an exit code out. That was the only interaction shape. If you wanted to pass arguments to your sandboxed code, you had to hand-assemble argument passing into your machine code. If you wanted structured output, you had to manually read the ring buffer data region and know the layout.
 
-## The Type Signature That Started Everything
+The core sandbox was doing double duty: managing process isolation (its real job) AND defining the I/O protocol (not its job).
 
-Early in the discussion, this type was proposed:
+## A Type Signature Sketch Changed Everything
+
+The user sketched a type signature on the fly:
 
 ```haskell
 _ :: Image -> (in -> (Image -> m Image)) -> (Image -> m (out, Image)) -> m (in -> m out)
 ```
 
-Reading this: given an initial Image, an injector (that encodes input into the Image), and an extractor (that decodes output from the Image), produce a callable function.
+This was rough, the user said it was "one-time usage only" and would need changes. But it captured something crucial: the I/O strategy (how you encode input, how you decode output) should be **parameters**, not hardcoded behavior. The sandbox provides the Image; the consumer provides the lens into it.
 
-This was the seed. It implied:
-- Image is mutable state
-- Injector and extractor are strategies provided by the consumer
-- The current hardcoded approach is just one strategy among many
+This one line reframed the entire project.
 
-## Image Has Three Components
+## Chasing the Right Abstraction for Image Access
 
-Image isn't just "a pointer to some memory." It has structure:
+We went through a whole journey trying to figure out how to interact with Image.
 
-1. **Execution context** — registers, stack pointer. The CPU state of the worker.
-2. **Opaque blob** — a small shared memory region. The I/O channel.
-3. **Polymorphic `s`** — everything else about the worker state that hatchery doesn't know about yet.
-
-The third component was important: it keeps Image open for extension without modifying hatchery's core types. But we eventually decided `s` should be the PrimMonad state token (like in `MutableByteArray s` or `STRef s`), and extra consumer state should live in the monad (via `ReaderT` etc.), not in Image. This is simpler and prevents Image from becoming a kitchen-sink type.
-
-## "Observation Mutates" — The Key Semantic Insight
-
-This was the turning point that killed the `Ref`/`IORef` analogy.
-
-In a sandbox backed by a live process, there is no such thing as a pure read. Reading a register might require stopping the process. Reading memory might involve a syscall with side effects. Even checking if the worker is alive can reap a zombie (changing process table state). Probing shared memory has cache-line effects.
-
-This isn't just an implementation detail — it's a fundamental property of the system. The abstraction should reflect it. Any interface that separates "read" from "write" (like `readRef`/`writeRef`) is lying about the semantics.
-
-This insight killed several candidate abstractions:
-- `data Ref m a = Ref { readRef :: m a, writeRef :: a -> m () }` — pretends read is non-destructive
-- Traditional lens (`Lens' s a`) — too pure
-- Even `IORef`-style mutable refs — they don't capture the entanglement between different parts of state
-
-### What "Observation Mutates" Means for the API
-
-Every interaction with the system is a **step** that:
-1. Takes input (what you're asking/sending)
-2. Produces output (what you observe/receive)
-3. Transitions the state (the system is different after)
-
-There's no way to "peek" without "stepping." This is Mealy machine semantics.
-
-## The Machine Connection
-
-Edward Kmett's `machines` package defines:
-
+**First try: `Ref` (like IORef)**
 ```haskell
-newtype MachineT m k o = MachineT { runMachineT :: m (Step k o (MachineT m k o)) }
-
-data Step k o r
-  = Stop
-  | Yield o r
-  | forall t. Await (t -> r) (k t) r
+data Ref m a = Ref { readRef :: m a, writeRef :: a -> m () }
 ```
+Seemed natural. Image has fields, each field is a Ref. But the user said something that stopped us cold:
 
-This captures stateful step-by-step computation with monadic effects. The `k` parameter is a GADT of requests — each `Await` asks for a value of type `t` via a request `k t`. The existential `t` makes this type-safe: the continuation must accept whatever type the request promises.
+> "It is an mutable object. Observation on it inevitably mutate it."
 
-Machine was a perfect model for the "observation mutates" semantics: each `step` is an `m` action, and the continuation `r` is the new machine after the interaction. No "peek without advancing."
+This killed `Ref`. In a sandbox backed by a live process, reading a register might require stopping the process. Checking if a worker is alive might reap a zombie. Even shared memory reads have cache-line effects. There is no non-destructive observation. `readRef`/`writeRef` pretends there is — it's a lie.
 
-**But Machine has a fatal flaw for our use case: it has no methods.** Machine's only interface is `step :: m (Step ...)`. You can advance it, but you can't send it typed requests from the outside. Machine is demand-driven (it pulls input via `Await`); we need something call-driven (the user pushes typed commands).
+**Second try: Optics/Lenses**
+Traditional `Lens' s a`. Even monadic variants. Rejected for the same reason — lenses assume get-put/put-get laws that don't hold when observation mutates.
 
-## Object: Machine + Methods = Coalgebra
+**Third try: Port (Mealy machine)**
+```haskell
+newtype Port m a b = Port { interact :: a -> m b }
+```
+Getting warmer — every interaction is effectful, takes input, produces output. But it doesn't capture the fact that the object *changes* after each interaction. You interact with a Port and it's the same Port. But our sandbox is different after every touch.
 
-The fix: take Machine's state semantics but add a typed method interface.
+## "What is Machine type in machine package?"
+
+The user asked this question and it cracked everything open.
+
+Edward Kmett's `machines` gives us `MachineT m k o` — a step-by-step automaton where each step is monadic, the continuation IS the new machine, and the GADT `k` types the requests. Perfect state-change semantics.
+
+But then the user pointed out: "Machine is a great abstraction for our mutable object, but it doesn't have method."
+
+Machine has `step`. You can advance it. But you can't send it a typed `ReadReg RAX` request and get a `Word64` back. Machine is demand-driven (it pulls via `Await`); we needed something call-driven (the user pushes typed commands).
+
+## The Object Falls Out
+
+Take Machine's state semantics (each interaction produces a new machine) and add typed methods (a GADT defining what you can ask):
 
 ```haskell
 data Object f m = Object
@@ -84,22 +65,19 @@ data Object f m = Object
   }
 ```
 
-This is a **coalgebraic object**. In coalgebraic semantics, objects are defined not by how you construct them (algebraic) but by how you observe them (coalgebraic). The GADT `f` defines the observations (methods). Each observation transitions the state and produces a result.
+This is a **coalgebraic object** — defined by its observations, not its construction. The GADT `f` is the method list. Each method call returns a result AND the new object. The old object is gone.
 
-The key difference from Machine:
-- Machine: `Await` — machine requests input (pull/demand-driven)
-- Object: `method` — caller sends request (push/call-driven)
-- Same state semantics, opposite control flow
+When we wrote this down, the user's reaction was: "That is perfect!!!!!"
 
-The returned `Object f m` after each call IS the new state. The old object is conceptually gone. This naturally captures "observation mutates" — you literally get a different object back.
+It captures everything:
+- Observation mutates (you get a new Object back)
+- Typed methods (GADT constrains inputs and outputs)
+- Effectful (everything is in `m`)
+- Stateful (the returned Object may behave differently)
 
-### Why Not Just Direct Functions?
+## The Free Monad Detour
 
-We considered just exposing `readReg :: Computer -> Register -> IO Word64` etc. — direct effectful functions on a mutable handle. This works but loses something: the Object type makes the "new state after each interaction" explicit in the types. With direct functions, mutation is hidden inside IO. With Object, the type `m (t, Object f m)` tells you: "you get a result AND a new object." Even if the implementation reuses the same mutable state, the type communicates the semantics.
-
-## The Free Monad Detour (and Why We Came Back)
-
-We briefly explored modeling strategies as free monad programs over the Interaction GADT:
+We briefly got excited about modeling strategies as free monad programs:
 
 ```haskell
 data Program a where
@@ -107,25 +85,22 @@ data Program a where
   Then :: Interaction t -> (t -> Program a) -> Program a
 ```
 
-A strategy would be a Program — a script that describes a sequence of interactions with the computer. Hatchery would interpret the script against a real worker.
+Write a script of interactions, hand it to hatchery, get results. Inspectable! Testable! Composable!
 
-**Pros**: inspectable (analyze before running), testable (interpret against a mock), composable.
+The user brought us back to earth: "However, we cannot interact with it."
 
-**Why we rejected it**: "We cannot interact with it." A pure Program is a batch script. You write it, hand it off, get the final result. You can't do IO between steps. You can't make Haskell-side decisions based on intermediate results in real time.
+A pure `Program` is a batch job. You can't do IO between steps. You can't make real-time decisions based on intermediate results. Adding `m` via `FreeT` recovers interactivity but loses inspectability — at which point you've reinvented `ReaderT Computer m a` with extra steps.
 
-Adding `m` via `FreeT Interaction m a` gets interactivity back, but then you lose inspectability (the `Lift` nodes are opaque `m` actions). At that point, `FreeT Interaction m a ≈ ReaderT Computer m a` — the indirection no longer pays for itself.
+The sandbox is something you **interact with in real time**, not something you **submit a script to**. Back to Object.
 
-**The lesson**: the sandbox is something you **interact with**, not something you **program**. The Object model (direct method calls, full IO interleaving) is the right abstraction.
+## Egg: Where Does the Object Come From?
 
-## Egg: The Reification Recipe
+The user connected it to the project's name: "If we provide an egg to hatchery, we get object as a return."
 
-The name comes from the project name (hatchery). An Egg is a blueprint that you give to the hatchery; the hatchery hatches it into a live Object.
+An Egg is a recipe for a live Object. It carries:
 
-An Egg carries two things:
-
-1. **The seed** (`eConfig` / `WorkerConfig`) — a concrete, value-level blob describing the initial physical state: memory layout, security policy, resource limits. The material from which the object is born.
-
-2. **The GADT method list** (`f`) paired with its interpreter (`img -> f ~> IO`) — the behavioral specification. The GADT defines WHAT methods exist (at the type level). The interpreter defines HOW each method maps to concrete operations on the backend's Image (at the value level).
+1. **A seed** — concrete worker configuration (memory layout, security policy). The physical material.
+2. **A GADT method list + interpreter** — what the object can do and how each method maps to concrete operations. The behavioral specification.
 
 ```haskell
 data Egg img f = Egg
@@ -134,184 +109,110 @@ data Egg img f = Egg
   }
 ```
 
-This is a **type-safe object factory**. The GADT ensures method signatures are statically checked. The interpreter provides dynamic behavior. The seed provides the physical substrate.
+The user emphasized: "Egg is also carrying type information GADT, a method list." The GADT isn't just a parameter — it IS the egg's identity. An `Egg img CCall` is a C-calling-convention egg. An `Egg img RawX86` is a raw-machine-code egg. The type tells you what will hatch.
 
-### Why Egg Is Novel
+### CCall: The First Concrete Egg
 
-The standard Haskell pattern for "thing with typed methods" is a typeclass. But typeclasses are:
-- Resolved at compile time (no runtime composition)
-- One instance per type (no multiple configurations)
-- Global (you can't have two different "CCall" instances with different register mappings)
+The C calling convention is one Egg type. The insight that made this click: **the ABI knowledge lives entirely in the interpreter**.
 
-The Egg pattern gives you:
-- Runtime composition (combine two Eggs via `:+:`)
-- Multiple configurations (same GADT, different interpreters — System V vs Win64)
-- First-class values (store in data structures, pass as arguments)
-- Type safety (GADT constrains method signatures)
+The GADT says `SetArg 0 value` — it doesn't say which register. The interpreter maps arg 0 → RDI (System V) or arg 0 → RCX (Win64). Same GADT, different interpreter, different ABI. You could parameterize the interpreter by architecture and get a generic calling convention egg.
 
-It's a **reified typeclass dictionary** with a factory method. But "reified typeclass dictionary" doesn't capture the full picture — the Egg also carries the seed (configuration), and the hatching process (resource allocation) is part of the abstraction.
+## PrimMonad: Image Tied to Its Context
 
-## CCall as Concrete Egg — ABI Lives in the Interpreter
+The user said: "I think m should be associated with s like in ST or IO monad, MonadPrim."
 
-The C calling convention (System V AMD64) becomes one concrete Egg. The GADT defines abstract operations (`SetArg 0 value`, `Call`, `GetReturn`). The interpreter maps these to registers:
+This was about safety. `Image s` where `s ~ PrimState m` — the same pattern as `STRef s` or `MutableByteArray s`. Image can't escape its monadic context. Extra consumer state (GPU handles, LLVM engines, whatever) lives in the monad via `ReaderT`, not in Image. Keeps Image focused.
 
-```
-SetArg 0 → RDI
-SetArg 1 → RSI
-SetArg 2 → RDX
-...
-```
+## Hatchery as Typeclass: The Late Realization
 
-The ABI knowledge is **entirely in the interpreter**. The GADT doesn't know about registers. This means:
-- Same GADT, different interpreter → different ABI (Win64 uses RCX, RDX, R8, R9)
-- The GADT is the abstract calling convention; the interpreter is the concrete ABI binding
-- You could write a `genericCallEgg :: ArchConfig -> Egg img CCall` that takes ABI parameters
+Near the end, the user said: "Now Hatchery should be a typeclass, and what we've been making is a particular instance for pool of workers in a x86-64 linux namespace."
 
-This is also how you'd support stack spill for > 6 integer args: the interpreter checks the arg index and either writes a register or writes to the stack region in shared memory.
-
-## Hatchery as Typeclass — What We Built Is One Backend
-
-Late realization: everything we built in v1 (fork server, seccomp, x86-64 namespaces, memfd, ring buffer, spin-wait) is a **specific isolation mechanism**, not the platform itself. Other mechanisms could provide the same Image-based interface:
-
-- KVM (hardware virtualization)
-- WASM runtime
-- Remote workers on another machine
-- Mock/simulation for testing
-
-Making Hatchery a typeclass with associated types (`HatchPool`, `HatchConfig`, `HatchImage`) means Eggs can be written polymorphically over backends, or tied to specific ones.
-
-The typeclass is appropriate here (unlike for Eggs) because the backend is a **compile-time / deployment-time choice**. You don't dynamically switch between "linux namespace" and "KVM" at runtime. The dynamic flexibility lives in the Egg/Object layer.
-
-## Hybrid Static/Dynamic — Records + Typeclasses
-
-We wanted both:
-- **Static dispatch** for known strategies (typeclass, nice syntax, compiler specialization)
-- **Dynamic dispatch** for runtime composition (records, first-class values)
-
-The solution: **the core API takes records, the typeclass converts to records**.
+This reframed the entire v1 effort. The fork server, seccomp, ring buffer, spin-wait — that's not "hatchery." That's `LinuxWorkerPool`, one backend. Hatchery is the abstract capability to hatch eggs into objects.
 
 ```haskell
--- Record: the universal runtime representation
+class Hatchery h where
+  type HatchPool h
+  type HatchConfig h
+  type HatchImage h
+  withPool :: HatchConfig h -> (HatchPool h -> IO a) -> IO a
+  hatch    :: HatchPool h -> Egg (HatchImage h) f -> IO (Object f IO)
+```
+
+Other backends — KVM, WASM, a mock for testing — would be other instances. The 365ns spin-wait latency is a property of the linux backend, not of the abstraction.
+
+## The Hybrid Static/Dynamic Pattern
+
+The user wanted both typeclass ergonomics AND runtime flexibility: "Can we have hybrid system?"
+
+The solution: **records as the core, typeclass as sugar**.
+
+```haskell
+-- The runtime value (always works, compose dynamically)
 data Egg img f = Egg { ... }
 
--- Typeclass: sugar for producing records from types
+-- The typeclass (convenience for known static strategies)
 class IsEgg s where
   type Methods s :: * -> *
   toEgg :: s -> Egg (EggImage s) (Methods s)
 ```
 
-Functions accept `Egg` values. The typeclass just provides a convenient way to produce them from type-level descriptions. This means:
-- You can always pass an Egg directly (dynamic)
-- You can use the typeclass for ergonomics (static)
-- Under the hood, both paths produce the same Egg record
-
-**Why this matters**: typeclasses are resolved at compile time, so you can't compose them at runtime. Records are first-class values — store them, pass them, combine them. By making the record primary, we keep full runtime flexibility.
-
-## Patterns We Explored and Rejected
-
-### Handle Pattern
-```haskell
-data Sandbox m in out = Sandbox { call :: in -> m out, close :: m () }
-```
-Closures capture Image internally. Consumer never sees Image. **Rejected because**: the user needs Image access for strategies that touch registers, memory, etc. Hides Image too much.
-
-### Backpack (Module-Level Abstraction)
-GHC Backpack: define a module signature, swap implementations at link time. Zero runtime cost. **Rejected because**: purely static — no dynamic dispatch at all. Backpack tooling is also less mature.
-
-### Tagless Final
-```haskell
-class MonadSandbox m where
-  type SIn m; type SOut m
-  inject :: SIn m -> Image -> m ()
-```
-The monad itself carries the strategy. **Rejected because**: forces consumers into a specific effect stack. Doesn't compose dynamically without existentials.
-
-### Lens/Optics for Image Access
-Traditional `Lens' Image a` or even monadic lenses. **Rejected because**: "observation mutates" breaks the lens laws (get-put, put-get). Lenses assume a clean separation between reading and writing that doesn't exist here.
-
-### Ref/IORef for Image Fields
-```haskell
-data Ref m a = Ref { readRef :: m a, writeRef :: a -> m () }
-```
-**Rejected because**: pretends read is non-destructive. Semantically wrong for a system where probing state changes state.
-
-### Port/Mealy Machine
-```haskell
-newtype Port m a b = Port { interact :: a -> m b }
-```
-Every interaction takes input, produces output. Close to the right semantics. **Evolved into Object**: Port doesn't capture the "new state after interaction" aspect. Object adds the returned `Object f m` to make state transitions explicit.
-
-## PrimMonad and the `s` Parameter
-
-Image is tied to its monadic context via `s ~ PrimState m`, the same pattern as `MutableByteArray s` and `STRef s`. This gives:
-
-1. **Safety**: Image can't escape its scope (if we provide a `runSandbox :: (forall s. ...) -> a` entry point)
-2. **Polymorphism**: Same operations work in IO and potentially ST (for testing)
-
-We considered making `s` also carry "extra consumer state" (GPU handles, etc.), but decided against it. Extra state lives in the monad (`ReaderT GpuContext IO`). This keeps Image focused on what hatchery owns (process state, shared memory, registers) and doesn't bloat the type.
-
-## Register Access — The Fork Server Change
-
-The biggest concrete change v2 requires: workers need a **register save area** in shared memory. Currently, the worker just calls `fn()` and writes the exit code. For the Object model to support `ReadReg`/`WriteReg`:
-
-1. Before execution: worker loads register values FROM the save area (so Haskell can set up arguments)
-2. After execution: worker saves register values TO the save area (so Haskell can read results)
-
-This is conceptually similar to how KVM exposes `struct kvm_regs` — the register file is a shared data structure that the host and guest exchange through.
-
-The save area would include GP registers (RAX through R15), XMM registers (XMM0-XMM7 for floating-point args/returns), RFLAGS, and RSP. Cache-line aligned for performance.
+The core API takes `Egg` records. The typeclass just produces them. You get static dispatch when you want it, dynamic composition when you need it. Under the hood, GHC compiles typeclasses into exactly this pattern anyway — dictionary passing. We're just making the dictionary explicit.
 
 ## Composition via Coproduct
 
-Method lists compose via sum type:
+Method lists combine:
 
 ```haskell
 data (f :+: g) t where
   L :: f t -> (f :+: g) t
   R :: g t -> (f :+: g) t
+
+combine :: Egg img f -> Egg img g -> Egg img (f :+: g)
 ```
 
-Two Eggs combine into one: `combine :: Egg img f -> Egg img g -> Egg img (f :+: g)`.
+`RawX86 :+: DebugOps` hatches an object that can execute code AND inspect registers. Two independent Eggs, composed at the value level.
 
-This is the coalgebraic analogue of mixin composition. The object supports methods from both `f` and `g`. Each method dispatches to the appropriate interpreter.
+Open question: deeply nested `:+:` has pattern-match overhead. For hot paths, a flat GADT with all methods is probably better. Both should coexist.
 
-Concrete example: `RawX86 :+: DebugOps` — an object that can both execute code AND inspect registers/memory for debugging. Built from two independent Eggs.
+## The Naming (and Why It Works)
 
-**Open question for implementation**: deeply nested `:+:` creates pattern match overhead. For performance-critical paths, a flat sum type (single GADT with all methods) might be better. The `:+:` composition is for modularity; the flat GADT is for performance. Both should be possible.
+- **Hatchery** — the incubator, the platform
+- **Egg** — the blueprint you bring to be hatched
+- **Object** — the live thing that comes out
+- **Image** — the object's physical state (VM image analogy)
+- **Seed** (eConfig) — the yolk, the material substrate
+- **Method list** (GADT f) — the DNA, the specification
+- **Interpreter** (f ~> IO) — gene expression, specification → behavior
 
-## The Naming
+## Patterns We Tried and Killed
 
-- **Hatchery**: the incubator / platform / backend
-- **Egg**: the blueprint you give to the hatchery
-- **Object**: the live thing that hatches out
-- **Image**: the object's internal physical state (like a VM image)
-- **Seed**: the concrete configuration inside the Egg (like the yolk — the material)
-- **Method list**: the GADT — what the object can do (like the DNA — the specification)
-- **Interpreter**: maps methods to effects (like gene expression — specification → behavior)
+For future sessions — don't rediscover these:
 
-## What the v1 Implementation Becomes
+| Pattern | Why Rejected |
+|---------|-------------|
+| Handle (closures over Image) | Hides Image too much. Consumer needs register/memory access. |
+| Backpack (module signatures) | Purely static. No dynamic composition. Immature tooling. |
+| Tagless final (monad carries strategy) | Forces specific effect stack. No dynamic composition without existentials. |
+| Lens/Optics | Observation mutates violates lens laws (get-put, put-get). |
+| Ref/IORef | Pretends read is non-destructive. Semantically wrong. |
+| Free monad Program | Can't interact in real time. Batch-only. FreeT + m ≈ ReaderT with extra indirection. |
+| Port/Mealy | Doesn't capture state change after interaction. Evolved into Object. |
 
-The fork server, seccomp, ring buffer, spin-wait, all the C code — that's `LinuxWorkerPool`, one instance of the `Hatchery` typeclass. The `hatchery-linux` package.
+## Open Questions We Didn't Resolve
 
-Its Image type (`LinuxImage`) would expose the shared memory regions, register save area, code region, and worker process handle. Its `hatch` implementation would acquire a worker from the pool, wire the Egg's interpreter to the LinuxImage, and return an Object.
+1. **Object linearity** — nothing prevents using the "old" Object reference after a method call. Linear types could enforce single-use. YAGNI?
 
-The spin-wait (~365ns) and futex (~3100ns) dispatch latency numbers are properties of THIS backend — not inherent to the Object model. Other backends would have different performance characteristics.
+2. **Error handling** — should Object encode failure in the return type (`Either Error t`)? Or let `m` handle it via exceptions? Probably the latter — keep Object simple.
 
-## Open Questions for Implementation
+3. **Pool-level dispatch** — `hatch` gives one Object from one worker. But sometimes you want "borrow a worker, do something, return it." That's a `dispatch :: Pool -> Egg f -> Strategy f in out -> in -> IO out` that manages the lifecycle. Probably needed.
 
-1. **Object linearity**: Currently Object returns itself after each call, but nothing prevents the user from using the "old" Object reference. Should we use linear types (`Linear Haskell`) to enforce that each Object is used exactly once? Or is this YAGNI?
+4. **Lifecycle & GC** — if an Object is GC'd without `destroy`, the worker leaks. GHC finalizers are unreliable for timely cleanup. Bracket pattern (`withComputer`) is safer. Should we make this the only API?
 
-2. **Error handling in methods**: What happens when a method fails? Currently `m` is IO so exceptions work. But should the Object type encode failure explicitly? `f t -> m (Either Error t, Object f m)`? Or is that over-engineering?
+5. **Performance** — Object indirection (method → interpreter → concrete ops) adds a function call per interaction. At 365ns cross-process round-trip, probably unmeasurable. But worth confirming.
 
-3. **Worker pool vs single worker**: The current design assumes `hatch` gives you one Object backed by one worker. But the v1 pool auto-selects workers. Should there be a pool-level dispatch that borrows a worker, runs a strategy, returns it? Probably yes — that's the `dispatch` function that takes a Strategy + Egg and handles worker lifecycle internally.
-
-4. **Lifecycle and GC**: When an Object is garbage collected without explicit `destroy`, what happens to the worker? `destroy` should release it back to the pool. A finalizer on the Image could handle this, but GHC finalizers are unreliable for timely cleanup. The bracket pattern (`withComputer`) is safer.
-
-5. **Performance of the Object pattern**: Each method call goes through `method obj msg` → interpreter → concrete operations. For spin-wait dispatch at 365ns, is the Object indirection measurable? Probably not — the cross-process cache-line round-trip dominates. But worth measuring.
-
-6. **Egg validation**: Should `hatch` validate that the Egg's config is compatible with the backend? E.g., requesting XMM register access on a backend that doesn't support it. Static (type-level) validation would be ideal but might require type-level machinery. Runtime validation is simpler.
+6. **Egg validation** — should `hatch` check that the Egg's needs match the backend's capabilities? (e.g., XMM registers on a backend without FPU support.) Type-level validation would be ideal, runtime is simpler.
 
 ---
 
-*Session: 2026-03-15, Claude Opus 4.6. Model ID: claude-opus-4-6[1m]. Session ID: 919c38de-05cd-402c-bbf5-e3dba6df4a9c.*
+*Session: 2026-03-15, Claude Opus 4.6. Session ID: 919c38de-05cd-402c-bbf5-e3dba6df4a9c.*
 *Conversation flow: payload-agnostic hatchery → Image with three components → opaque effectful lens → observation mutates → Machine type connection → coalgebraic Object → Egg reification → Hatchery typeclass → clean master.*
