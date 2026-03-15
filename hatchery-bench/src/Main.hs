@@ -4,6 +4,7 @@ import Hatchery
 import qualified Data.ByteString as BS
 import System.CPUTime
 import Text.Printf (printf)
+import Data.Word (Word32)
 
 -- FFI baselines: same return42 function via different call conventions
 foreign import ccall unsafe "return42" unsafeReturn42 :: IO Int
@@ -57,6 +58,16 @@ main = do
 
       avgRun <- timeN hn (run pw)
       printf "  hatchery (pre-loaded): %7.2f us/call  (%d calls)\n" avgRun hn
+
+  -- Spin-wait pre-loaded payload
+  let spinCfg = defaultConfig { poolSize = 2, waitStrategy = SpinWait 10000 }
+  withHatchery spinCfg $ \h -> do
+    withPrepared h UseSharedMemfd payload $ \pw -> do
+      -- warmup
+      mapM_ (\_ -> run pw) [1..10 :: Int]
+
+      avgSpin <- timeN hn (run pw)
+      printf "  hatchery (spin-wait): %7.2f us/call  (%d calls)\n" avgSpin hn
 
   -- Fault tolerance demo
   putStrLn ""
