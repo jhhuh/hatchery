@@ -1,8 +1,8 @@
-# hatchery
+# hatchery / trustless-ffi
 
-Trustless computation for runtime codegen. Execute JIT-compiled or foreign machine code with full process isolation at FFI-competitive latency.
+Trustless computation for runtime codegen. Execute JIT-compiled or foreign machine code with full process isolation and fault tolerance, at FFI-competitive latency.
 
-Generate code at runtime with LLVM, dispatch it, and get results back — with the guarantee that crashes, hangs, and wild writes cannot propagate to the host. Dispatch overhead is ~3-5 microseconds, on par with GHC's native FFI calling convention.
+Generate code at runtime with LLVM, dispatch it, and get results back — with the guarantee that crashes, hangs, and wild writes cannot propagate to the host. If foreign code segfaults, you get a `Crashed` result, not a dead process.
 
 ## Packages
 
