@@ -58,9 +58,6 @@ foreign import ccall "hatchery_mmap_code"
 foreign import ccall "hatchery_munmap_ring"
   c_munmap_ring :: Ptr () -> CULong -> IO CInt
 
-foreign import ccall "hatchery_set_spin_mode"
-  c_set_spin_mode :: Ptr () -> Word32 -> IO ()
-
 foreign import ccall "close"
   c_close :: CInt -> IO CInt
 
