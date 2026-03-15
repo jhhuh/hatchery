@@ -4,7 +4,7 @@ import Hatchery
 import qualified Data.ByteString as BS
 import System.CPUTime
 import Text.Printf (printf)
-import Data.Word (Word32)
+import PrimBaseline (primReturn42)
 
 -- FFI baselines: same return42 function via different call conventions
 foreign import ccall unsafe "return42" unsafeReturn42 :: IO Int
@@ -14,12 +14,13 @@ foreign import ccall safe   "return42" safeReturn42   :: IO Int
 payload :: BS.ByteString
 payload = BS.pack [0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3]
 
+-- | Returns average time per call in nanoseconds.
 timeN :: Int -> IO a -> IO Double
 timeN n act = do
   start <- getCPUTime
   go n
   end <- getCPUTime
-  return $ fromIntegral (end - start) / 1e6 / fromIntegral n
+  return $ fromIntegral (end - start) / 1e3 / fromIntegral n
   where
     go 0 = return ()
     go i = act >> go (i - 1)
@@ -32,11 +33,14 @@ main = do
   putStrLn ""
 
   -- FFI baselines
+  avgPrim <- timeN n primReturn42
+  printf "  foreign import prim:  %8.1f ns/call  (%d calls)\n" avgPrim n
+
   avgUnsafe <- timeN n unsafeReturn42
-  printf "  unsafe ccall:         %8.2f us/call  (%d calls)\n" avgUnsafe n
+  printf "  unsafe ccall:         %8.1f ns/call  (%d calls)\n" avgUnsafe n
 
   avgSafe <- timeN n safeReturn42
-  printf "  safe ccall:           %8.2f us/call  (%d calls)\n" avgSafe n
+  printf "  safe ccall:           %8.1f ns/call  (%d calls)\n" avgSafe n
 
   -- Hatchery
   let hn = 10000
@@ -45,10 +49,10 @@ main = do
     mapM_ (\_ -> dispatch h UseSharedMemfd payload) [1..10 :: Int]
 
     avgMemfd <- timeN hn (dispatch h UseSharedMemfd payload)
-    printf "  hatchery (memfd):     %8.2f us/call  (%d calls)\n" avgMemfd hn
+    printf "  hatchery (memfd):     %8.1f ns/call  (%d calls)\n" avgMemfd hn
 
     avgVmw <- timeN hn (dispatch h UseProcessVmWritev payload)
-    printf "  hatchery (vm_writev): %8.2f us/call  (%d calls)\n" avgVmw hn
+    printf "  hatchery (vm_writev): %8.1f ns/call  (%d calls)\n" avgVmw hn
 
   -- Pre-loaded payload (no re-injection)
   withHatchery defaultConfig { poolSize = 2 } $ \h -> do
@@ -57,7 +61,7 @@ main = do
       mapM_ (\_ -> run pw) [1..10 :: Int]
 
       avgRun <- timeN hn (run pw)
-      printf "  hatchery (pre-loaded): %7.2f us/call  (%d calls)\n" avgRun hn
+      printf "  hatchery (pre-loaded): %7.1f ns/call  (%d calls)\n" avgRun hn
 
   -- Spin-wait pre-loaded payload
   let spinCfg = defaultConfig { poolSize = 2, waitStrategy = SpinWait 10000 }
@@ -67,7 +71,7 @@ main = do
       mapM_ (\_ -> run pw) [1..10 :: Int]
 
       avgSpin <- timeN hn (run pw)
-      printf "  hatchery (spin-wait): %7.2f us/call  (%d calls)\n" avgSpin hn
+      printf "  hatchery (spin-wait):  %7.1f ns/call  (%d calls)\n" avgSpin hn
 
   -- Fault tolerance demo
   putStrLn ""
