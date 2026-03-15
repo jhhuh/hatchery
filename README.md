@@ -1,8 +1,8 @@
 # hatchery
 
-Process sandbox toolkit for Haskell. Pre-spawned worker pools with microsecond dispatch latency.
+Trustless computation for runtime codegen. Execute JIT-compiled or foreign machine code in process-isolated sandboxes with microsecond dispatch latency.
 
-Workers are address-space-isolated, seccomp-filtered, and supervised. Crashes, hangs, and wild writes in foreign code cannot propagate to the host process.
+Generate code at runtime with LLVM, run it in a pre-spawned worker pool, and get results back — with the guarantee that crashes, hangs, and wild writes cannot propagate to the host.
 
 ## Packages
 
