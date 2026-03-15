@@ -56,6 +56,13 @@ void hatchery_wake_worker(void *ring_base)
     syscall(__NR_futex, control, FUTEX_WAKE, 1, NULL, NULL, 0);
 }
 
+/* Wake worker that is spin-waiting: release-store only, no syscall */
+void hatchery_wake_worker_spin(void *ring_base)
+{
+    uint32_t *control = (uint32_t *)((char *)ring_base + RING_CONTROL_OFF);
+    __atomic_store_n(control, WORKER_RUN, __ATOMIC_RELEASE);
+}
+
 /* Wait for worker completion. Returns:
  *  0 = done (exit_code written to *out_exit_code)
  * -1 = worker crashed/dead  */

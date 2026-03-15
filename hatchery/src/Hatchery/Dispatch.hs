@@ -67,6 +67,9 @@ foreign import ccall "hatchery_munmap_ring"
 foreign import ccall "hatchery_wake_worker"
   c_wake_worker :: Ptr () -> IO ()
 
+foreign import ccall "hatchery_wake_worker_spin"
+  c_wake_worker_spin :: Ptr () -> IO ()
+
 foreign import ccall "hatchery_wait_worker"
   c_wait_worker :: Ptr () -> CInt -> Ptr Int32 -> IO CInt
 
@@ -193,11 +196,10 @@ prepare h method codeBytes = do
 -- Direct Haskell↔worker path: no socketpair, no fork server.
 run :: PreparedWorker -> IO DispatchResult
 run pw = do
-  c_wake_worker (pwRingPtr pw)
   case waitStrategy (hConfig (pwHatchery pw)) of
-    FutexWait   -> runFutex pw
-    SpinWait n  -> runSpin pw n
-    SpinWaitC n -> runSpinC pw n
+    FutexWait   -> c_wake_worker (pwRingPtr pw) >> runFutex pw
+    SpinWait n  -> c_wake_worker_spin (pwRingPtr pw) >> runSpin pw n
+    SpinWaitC n -> c_wake_worker_spin (pwRingPtr pw) >> runSpinC pw n
 
 -- | Original futex-based wait.
 runFutex :: PreparedWorker -> IO DispatchResult
