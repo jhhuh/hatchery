@@ -1,5 +1,21 @@
 {
   "nodes": {
+    "inline-cmm": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1769277254,
+        "narHash": "sha256-W9HzU6yGUb/vvmmW4uP+88cp97QcBsYDSTSgju4Q3qo=",
+        "owner": "jhhuh",
+        "repo": "inline-cmm",
+        "rev": "231b3ea066dde052780b624d6e22c73eba6a356e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jhhuh",
+        "repo": "inline-cmm",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1773507054,
@@ -18,6 +34,7 @@
     },
     "root": {
       "inputs": {
+        "inline-cmm": "inline-cmm",
         "nixpkgs": "nixpkgs"
       }
     }

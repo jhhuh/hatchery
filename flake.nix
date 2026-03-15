@@ -3,9 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    inline-cmm.url = "github:jhhuh/inline-cmm";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, inline-cmm }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
@@ -20,6 +21,7 @@
             hatchery-bench = ./hatchery-bench;
             hatchery-llvm  = ./hatchery-llvm;
             trustless-ffi  = ./trustless-ffi;
+            inherit inline-cmm;
           })
           (hself: hsuper: {
             # llvm-ffi: follow nixpkgs pattern — LLVM = null, add .lib/.dev
@@ -61,6 +63,7 @@
         hatchery-bench = hsPkgs.hatchery-bench;
         hatchery-llvm  = hsPkgs.hatchery-llvm;
         trustless-ffi  = hsPkgs.trustless-ffi;
+        inherit (hsPkgs) inline-cmm;
         default        = hsPkgs.hatchery;
       };
       devShells.${system}.default = haskellShell;
