@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Phase 1 complete, Phase 2 partial. Core sandbox works end-to-end. Spin-wait mode for pre-loaded workers implemented (~553ns dispatch via inline-cmm Cmm spin loop). LLVM integration stubbed (llvm-ffi build issue). See `artifacts/devlog.md` for history.
+Phase 1 complete, Phase 2 partial. Core sandbox works end-to-end. Spin-wait mode for pre-loaded workers implemented (~350ns dispatch via inline-cmm Cmm spin loop, ~3100ns via futex, ~5500ns one-shot dispatch). LLVM integration stubbed (llvm-ffi build issue). See `artifacts/devlog.md` for history.
 
 ## What This Is
 

@@ -24,21 +24,26 @@ GHC Process (Haskell)
         │                     single-threaded, epoll-based, no libc, raw syscalls
         │
         ├──► Worker 0         own address space, seccomp-filtered
-        ├──► Worker 1         futex-suspended until dispatch
+        ├──► Worker 1         spin/futex-suspended until dispatch
         └──► ...              PROT_RWX code region + MAP_SHARED ring buffer
 ```
 
-A minimal C supervisor (~600 lines, musl static-PIE, no libc) is embedded in the Haskell binary at compile time via Template Haskell. Sandboxed execution contexts are pre-warmed so that dispatch is a memfd write + futex wake — no process spawn on the hot path.
+A minimal C supervisor (~750 lines, musl static-PIE, no libc) is embedded in the Haskell binary at compile time via Template Haskell. Sandboxed execution contexts are pre-warmed so that dispatch is a memfd write + futex wake — no process spawn on the hot path.
 
-### Measured latency (return 42 workload)
+### Measured latency (return 42 workload, 100k iterations)
 
 ```
-unsafe ccall:          <0.01 us/call
-safe ccall:             0.07 us/call
-hatchery (vm_writev):   5.08 us/call  (full process isolation + seccomp)
-hatchery (memfd):       5.33 us/call  (full process isolation + seccomp)
+foreign import prim:       0.3 ns/call  (register shuffle, no stack frame)
+unsafe ccall:              1.4 ns/call  (C ABI overhead)
+safe ccall:               68   ns/call  (releases GHC capability)
+hatchery (spin-wait Cmm): 365  ns/call  (Cmm spin, no futex syscalls)
+hatchery (spin-wait C):   370  ns/call  (C spin, GCC-inlined atomics)
+hatchery (pre-loaded):   3100  ns/call  (direct futex wake/wait, no fork server)
+hatchery (vm_writev):    5500  ns/call  (code injection + fork server relay)
+hatchery (memfd):        5950  ns/call  (code injection + fork server relay)
 ```
 
+Spin-wait (~365ns) is at the hardware floor — two cross-process cache-line round-trips.
 Works with both `-threaded` and single-threaded GHC RTS.
 
 ## Quick start
@@ -121,11 +126,20 @@ The fork server binary is compiled at Template Haskell time via `$HATCHERY_CC` (
 2. **Fork server dies → all workers die**: Workers have `PDEATHSIG=SIGKILL` set.
 3. **Worker crashes → detected**: Fork server detects via `wait4(WNOHANG)` and reports `Crashed` to Haskell.
 
+## Dispatch modes
+
+| Mode | Latency | Use case |
+|---|---|---|
+| `dispatch` | ~5.5 μs | One-shot: inject code + execute + return result |
+| `prepare` / `run` | ~3.1 μs (futex) or ~365 ns (spin) | Pre-load code once, re-run many times |
+
+**Spin-wait** (`SpinWait N`): Worker and Haskell spin N iterations before falling back to futex. Eliminates syscalls on the hot path. Configurable via `waitStrategy` in `HatcheryConfig`.
+
 ## Status
 
-Phase 1 is complete: core sandbox works end-to-end with both injection methods and crash detection. See `PLAN.md` for the full roadmap.
+Phase 1 complete, Phase 2 partial. Core sandbox works end-to-end with both injection methods, crash detection, and spin-wait mode.
 
-**Not yet implemented**: worker respawn on crash, PID namespace isolation (`CLONE_NEWPID`), dispatch timeout enforcement, LLVM codegen (stubbed).
+**Not yet implemented**: worker respawn on crash, PID namespace isolation (`CLONE_NEWPID`), dispatch timeout enforcement, LLVM codegen (stubbed), direct memfd writes for `dispatch` (would cut one-shot latency to ~3μs).
 
 ## License
 

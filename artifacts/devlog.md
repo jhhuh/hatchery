@@ -200,9 +200,31 @@ hatchery (vm_writev):    5515  ns
 hatchery (memfd):        5949  ns
 ```
 
-### Note: benchmark timing with -threaded RTS
+### GHC -threaded RTS investigation (no bug found)
 
-Investigated apparent "hang" with `-threaded` and no explicit `-N` flag. After thorough strace analysis and GHC RTS threading model review (Marlow's concurrency FFI paper, GHC manual), the conclusion was simple: the benchmark takes ~15s total, and the test timeout was 10s. All RTS configurations complete correctly — no deadlock, no scheduler starvation. Explicit `+RTS -N1` is fastest for this single-threaded workload (~8s); `-N` (all cores) adds scheduler overhead (~15s).
+Benchmark appeared to "hang" with `-threaded` and no explicit `-N` flag. Investigated via strace (`-f` with full syscall tracing, 870k lines) and reviewed GHC RTS threading model (Marlow's "Extending the Haskell FFI with Concurrency" paper, GHC manual, takenobu-hs GHC illustrated PDF).
+
+**What we explored:**
+- GHC RTS threading model: HEC (capability) = fixed struct holding execution context; Task = OS thread assigned to a HEC. Tasks can be reassigned. Safe FFI releases the HEC so other tasks can pick it up.
+- `PR_SET_PDEATHSIG` tracks the creating **thread**, not process — relevant for fork server lifetime with `-threaded`. `runInBoundThread` in `withHatchery` keeps the vforking OS thread alive for the bracket's duration, so PDEATHSIG is safe.
+- Safe FFI in `-threaded` does NOT block other Haskell threads (confirmed by GHC manual: "it is only necessary to use the -threaded option when linking your program, and to make sure the foreign import is not marked unsafe").
+- `fdReadBuf`/`fdWriteBuf` from `System.Posix.IO` are safe FFI — raw blocking `read()`/`write()`, not using GHC's I/O manager.
+- `-N` without argument picks up hardware thread count (hyperthreads), not physical cores.
+
+**Conclusion:** No bug. The benchmark takes ~15s with `-threaded` default (implicit `-N1`), and even longer with `-N` (all cores — more HEC scheduler overhead for single-threaded workload). The test timeout was 10s. All configurations complete correctly:
+
+| Config | Time |
+|---|---|
+| `-threaded +RTS -N1` | ~8s |
+| `-threaded` (no flags, implicit `-N1`) | ~15s |
+| `-threaded +RTS -N` (all cores) | ~15s |
+| `-threaded +RTS -N2` | ~15s |
+| non-threaded | ~15s |
+
+**References for future sessions:**
+- Marlow's FFI concurrency paper: https://www.microsoft.com/en-us/research/wp-content/uploads/2004/09/conc-ffi.pdf
+- GHC illustrated (HEC/Task/capability model): https://takenobu-hs.github.io/downloads/haskell_ghc_illustrated.pdf
+- `-keep-tmp-files` GHC flag to inspect `inline-cmm` generated `.cmm` files (but note: `inline-cmm` explicitly `removeFile`s the `.cmm` after compilation — would need to patch the library to keep them)
 
 ## Next steps for following sessions
 
