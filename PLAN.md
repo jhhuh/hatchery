@@ -179,15 +179,16 @@ Measured dispatch latency: ~5-6μs (excluding code execution time)
 ### Latency Reference (measured, same `return 42` workload)
 
 ```
-unsafe ccall:              <0.01 us/call
-safe ccall:                ~0.08 us/call
-hatchery (pre-loaded):     ~3.08 us/call  (direct futex, no fork server relay)
-hatchery (vm_writev):      ~5.23 us/call  (code injection every dispatch)
-hatchery (memfd):          ~5.96 us/call  (code injection every dispatch)
-hatchery (spin-wait):      ~0.50 us/call  (Cmm spin N=10000, futex fallback)
+foreign import prim:       0.3 ns   (register shuffle, no stack frame)
+unsafe ccall:              1.2 ns   (C ABI overhead)
+safe ccall:               68.8 ns   (releases GHC capability)
+hatchery (spin-wait):    553   ns   (Cmm spin + cross-process round-trip)
+hatchery (pre-loaded):  3073   ns   (direct futex, no fork server relay)
+hatchery (memfd):       6030   ns   (code injection + fork server relay)
+hatchery (vm_writev):   6108   ns   (code injection + fork server relay)
 ```
 
-**TODO**: Measure `foreign import prim` baseline.
+**Measured** with `inline-cmm` prim baseline. See devlog for detailed interpretation.
 
 ## Implementation Status
 

@@ -126,19 +126,36 @@ data WaitStrategy = FutexWait | SpinWait !Word32
 ### Measured latency
 
 ```
-unsafe ccall:              <0.01 us/call
-safe ccall:                ~0.07 us/call
-hatchery (pre-loaded):     ~3.22 us/call  (direct futex, no fork server relay)
-hatchery (spin-wait):      ~0.50 us/call  (Cmm spin, N=10000)
-hatchery (vm_writev):      ~5.50 us/call  (code injection every dispatch)
-hatchery (memfd):          ~5.52 us/call  (code injection every dispatch)
+foreign import prim:       0.3 ns   (register shuffle, no stack frame)
+unsafe ccall:              1.2 ns   (C ABI overhead: save/restore regs, stack align)
+safe ccall:               68.8 ns   (releases GHC capability, allows GC)
+hatchery (spin-wait):    553.3 ns   (Cmm spin + cross-process round-trip)
+hatchery (pre-loaded):  3073.2 ns   (direct futex wake/wait, no fork server)
+hatchery (memfd):       6029.6 ns   (code injection + fork server relay)
+hatchery (vm_writev):   6108.4 ns   (code injection + fork server relay)
 ```
 
-Spin-wait is **6.4x faster** than futex for the pre-loaded path.
+### Interpretation
+
+**prim (0.3ns) vs unsafe ccall (1.2ns)**: `foreign import prim` uses the STG calling convention — arguments and results pass in GHC's own machine registers (R1, R2, ...) with no stack frame. `unsafe ccall` must transition to the C ABI (push callee-saved registers, align stack, follow System V AMD64 calling convention). The 4x gap is purely calling convention overhead. Both are negligible in absolute terms.
+
+**safe ccall (69ns)**: The safe FFI releases the GHC capability before entering C, allowing other Haskell threads and the GC to run. Re-acquiring the capability on return involves an atomic CAS + potential scheduler interaction. The ~67ns gap over unsafe is the cost of capability release/reacquire.
+
+**spin-wait (553ns)**: The spin-wait path eliminates futex syscalls from the Haskell side. The remaining ~550ns is:
+- `c_wake_worker` unsafe ccall: release-store to `control` + `futex_wake` syscall (~200ns). This is the only syscall on the Haskell side — the worker is already spinning, but we still call futex_wake unconditionally. Eliminating this when the worker is spinning would save ~200ns.
+- Cross-process cache-line round-trip: Haskell writes `control` (core A) → worker reads it (core B) → worker writes `status` (core B) → Haskell reads it (core A). Two cache-line invalidation round-trips at ~100-150ns each on modern Intel.
+- Cmm prim call/return overhead + ccall to `hatchery_atomic_read32` per spin iteration. The ccall from Cmm to C crosses a compilation unit boundary (no LTO), so each poll iteration costs a function call. However, the worker completes fast enough that only a few iterations execute before status becomes DONE.
+
+**pre-loaded futex (3073ns) vs spin-wait (553ns)**: The 2520ns gap is almost entirely two futex syscalls. `futex_wake` on the wake side (~200ns) and `futex_wait` + wakeup latency on the Haskell wait side (~2000ns). The futex_wait path involves: syscall entry → kernel futex hash table lookup → schedule the waiter → later: wake event → context switch → syscall return. The spin-wait path avoids all of this — the status field change is visible via cache coherence in ~100-150ns.
+
+**dispatch paths (6030-6108ns)**: These go through the fork server. The additional ~3000ns over pre-loaded futex is: Haskell writes command+code over socketpair (~500ns) → fork server reads from socketpair (~200ns) → fork server injects code via pwrite/process_vm_writev (~500ns) → fork server wakes worker and waits → fork server writes response over socketpair → Haskell reads response. Two extra socketpair round-trips and code injection explain the gap.
+
+**memfd vs vm_writev (6030 vs 6108ns)**: Statistically indistinguishable. `pwrite` to memfd and `process_vm_writev` have similar kernel paths for small payloads (6 bytes). The theoretical advantage of memfd (worker already has the mapping, no cross-process page table walk) only matters for larger payloads.
 
 ### Known issues
-- **x86_64 only**: Cmm spin uses plain loads (correct on x86 TSO). ARM needs `%acquire`/`%release` with `W_` and masking.
-- **No pause instruction in Cmm**: The Cmm spin loop doesn't emit `PAUSE` (x86 hint for spin-wait loops). GHC Cmm has no intrinsic for it. Could add via inline asm in future.
+- **Unnecessary futex_wake in spin-wait path**: `c_wake_worker` always calls `futex_wake` even when the worker is spinning and doesn't need it. Skipping the syscall when `spin_count > 0` would save ~200ns.
+- **ccall overhead in Cmm spin loop**: Each poll iteration calls `hatchery_atomic_read32` via ccall (cross-compilation-unit, no inlining). On x86 where seq_cst loads are free MOVs, the ccall overhead dominates the per-iteration cost.
+- **x86_64 only**: Cmm spin uses seq_cst via C wrappers. ARM would need different treatment.
 - **`dispatch` still serializes through socketpair**: Unchanged from before.
 
 ## Next steps for following sessions

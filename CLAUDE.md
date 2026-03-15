@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Phase 1 complete. Core sandbox works end-to-end (spawn → dispatch → result → crash detection). LLVM integration stubbed (llvm-ffi build issue). See `artifacts/devlog.md` for history.
+Phase 1 complete, Phase 2 partial. Core sandbox works end-to-end. Spin-wait mode for pre-loaded workers implemented (~553ns dispatch via inline-cmm Cmm spin loop). LLVM integration stubbed (llvm-ffi build issue). See `artifacts/devlog.md` for history.
 
 ## What This Is
 
@@ -57,15 +57,15 @@ The fork server ELF is compiled **at TH time** by `Hatchery.Internal.Compile`, w
 
 ```
 GHC Process → socketpair/pipe → Fork Server (static-PIE C, embedded in binary)
-                                   ├─► Worker 0 (futex-suspended, seccomp-filtered)
+                                   ├─► Worker 0 (spin/futex-suspended, seccomp-filtered)
                                    ├─► Worker 1
                                    └─► ...
 ```
 
 - **Fork server** (`cbits/fork_server.c`): Pure C, static-PIE ELF (musl), no libc, raw syscalls (`syscall.h`). Single-threaded epoll loop. Spawns workers via `fork()`. Entry point: `_start` (naked) → `real_start` (parses argc/argv for fd numbers and config).
 - **Workers**: Own address space, PROT_RWX code region, MAP_SHARED ring buffer (memfd), seccomp filter. Execute injected machine code as `int fn(void)`.
-- **Communication**: socketpair for commands (`protocol.h` structs, 16-byte command / 20-byte response), ring buffer for data + synchronization. Futex for worker wake/notify.
-- **Lifecycle**: Parent death → pipe EOF → fork server exits. Worker crash detected via pidfd + `kill(pid, 0)` liveness check.
+- **Communication**: socketpair for commands (`protocol.h` structs, 16-byte command / 20-byte response), ring buffer for data + synchronization. Futex or spin-wait for worker wake/notify.
+- **Lifecycle**: Parent death → pipe EOF → fork server exits. Worker crash detected via pidfd epoll (fork server writes `WORKER_CRASHED` to ring buffer).
 - **Haskell spawn path**: `Core.withHatchery` → `Vfork.spawnForkServer` (FFI to `vfork_helper.c`) → `execveat` of the embedded ELF via memfd.
 
 ### Wire protocol
@@ -85,7 +85,7 @@ Per-dispatch `InjectionMethod`: `UseProcessVmWritev | UseSharedMemfd`. Mismatch 
 
 - **`$HATCHERY_CC` must be set** — TH compilation fails without it. The nix flake sets it automatically.
 - **PR_SET_DUMPABLE=0 blocks process_vm_writev** — intentionally omitted from workers
-- **`withHatchery` requires bound thread** — use `-threaded` GHC flag, call from main or `forkOS`
+- **`withHatchery` uses `runInBoundThread`** — works with both `-threaded` (creates bound thread if needed) and single-threaded RTS (runs directly)
 - **4096-byte code buffer in fork_server.c** — limits injected code size (Phase 1 limitation)
 - **`-fno-stack-protector` required** — GCC 15 enables stack protector by default, but `-nostartfiles` binary has no TLS → segfault on `%fs:0x28` access
 - **`_start` must be `naked`** — GCC 15 adds prologue that corrupts RSP before inline asm can capture it
