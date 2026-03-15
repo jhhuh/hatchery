@@ -166,16 +166,43 @@ This is at the hardware floor — you can't communicate between two processes fa
 
 ## Next steps for following sessions
 
-### Immediate (Phase 2 completion)
+### Next session: Direct memfd writes for `dispatch`
 
-1. **Direct memfd writes for `dispatch`** — Extend the `pidfd_getfd` + mmap pattern from `prepare` to regular `dispatch`. Eliminate code serialization through the socketpair entirely. Socketpair carries only control signals.
+**Goal**: Cut one-shot dispatch latency from ~6000ns to ~3000ns by writing code directly to the worker's memfd from Haskell, bypassing socketpair serialization.
 
-2. **ResourceT integration** — Add `ResourceT`-compatible API for flat registration of runtime foreign functions. Avoids bracket nesting for applications that discover/compile code dynamically (plugins, JIT, REPL).
+**Current path** (`dispatch`):
+```
+Haskell → [code bytes over socketpair] → Fork Server → [pwrite to code_fd] → Worker
+```
+Two socketpair round-trips (~1000ns) + fork server relay overhead.
 
-3. **Worker respawn** — When a worker crashes, fork server spawns a replacement via `fork()`. Update pool state, re-add pidfd to epoll.
+**New path**:
+```
+Haskell → [direct write to mmap'd code_fd] → [control signal over socketpair] → Fork Server → Worker
+```
+Haskell writes code directly to the memfd (already mmap'd in Haskell process for `prepare` path). Socketpair carries only the dispatch command (no inline code bytes). Fork server wakes the worker.
+
+**What exists**: The `prepare` path already does `pidfd_getfd` to duplicate the fork server's memfds into Haskell, then mmaps them. The plumbing is proven. The task is to make `dispatch` optionally use the same pattern — either eagerly (mmap at `withHatchery` time for all workers) or lazily (mmap on first dispatch to each worker).
+
+**Key decisions**:
+- Eager vs lazy mmap: eager is simpler (mmap all workers at startup), costs ~N×4KB virtual address space.
+- Wire protocol change: `CMD_DISPATCH` currently sends code bytes inline. New variant (or flag) tells fork server "code already written to memfd, just wake the worker."
+- API change: none. `dispatch` signature stays the same. The optimization is internal.
+
+**Files to modify**:
+- `direct_helpers.c`: add `hatchery_write_code` (memcpy to mmap'd code region)
+- `protocol.h` / `fork_server.c`: new command or flag for "code pre-written"
+- `Dispatch.hs`: `dispatch` writes to mmap'd memfd, sends lightweight command
+- `Core.hs`: mmap worker memfds at startup (eager path)
+
+### Following sessions (Phase 2 completion)
+
+2. **Worker respawn** — When a worker crashes, fork server spawns a replacement via `fork()`. Update pool state. Straightforward since fork server already monitors all workers' pidfds via epoll.
+
+3. **ResourceT integration** — `ResourceT`-compatible API for flat `allocate`/`release` of sandbox-backed foreign functions. Avoids bracket nesting for plugins, JIT, REPL use cases.
 
 ### Later (Phase 3+)
 
-4. **`CLONE_NEWPID`** — Fork server as PID 1 in a PID namespace. Belt-and-suspenders for worker cleanup.
+4. **`CLONE_NEWPID`** — Fork server as PID 1 in a PID namespace.
 5. **Timeout enforcement** — timerfd per dispatch, integrated with epoll.
-6. **TH compile pattern extraction** — The `compileForkServer` TH pattern (env var compiler + `addDependentFile` + `readProcessWithExitCode` in Q monad) is reusable. Consider extracting as a standalone package (`th-compile-embed` or similar).
+6. **TH compile pattern extraction** — `compileForkServer` TH pattern as standalone package.
