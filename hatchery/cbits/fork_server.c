@@ -578,14 +578,8 @@ static void __attribute__((noreturn)) fork_server_main(void)
 
 /* ── Entry point ─────────────────────────────────────────────────────── */
 
-void __attribute__((noreturn)) _start(void)
+__attribute__((noreturn, used)) void real_start(unsigned long *sp)
 {
-    /* Extract argc/argv from the stack.
-     * At _start, RSP points to: [argc, argv[0], argv[1], ..., NULL, ...]
-     * We use inline asm to grab RSP, then read from there. */
-    unsigned long *sp;
-    __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
-
     int argc = (int)sp[0];
     char **argv = (char **)(sp + 1);
 
@@ -605,4 +599,14 @@ void __attribute__((noreturn)) _start(void)
         sys_exit_group(3);
 
     fork_server_main();
+}
+
+/* naked _start: capture RSP before the compiler adds a prologue */
+__attribute__((naked, noreturn)) void _start(void)
+{
+    __asm__ volatile(
+        "mov %%rsp, %%rdi\n"  /* pass original sp as first arg */
+        "call real_start\n"
+        ::: "memory"
+    );
 }
