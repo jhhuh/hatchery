@@ -43,7 +43,7 @@ main = do
   printf "  safe ccall:           %8.1f ns/call  (%d calls)\n" avgSafe n
 
   -- Hatchery
-  let hn = 10000
+  let hn = 100000
   withHatchery defaultConfig { poolSize = 1 } $ \h -> do
     -- warmup
     mapM_ (\_ -> dispatch h UseSharedMemfd payload) [1..10 :: Int]
