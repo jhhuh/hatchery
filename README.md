@@ -19,7 +19,7 @@ GHC Process (Haskell)
   │
   │  socketpair (control)     pipe (parent-liveness)
   │
-  └──► Fork Server            static-PIE C binary, embedded via file-embed
+  └──► Fork Server            static-PIE C binary, compiled + embedded at TH time
         │                     single-threaded, epoll-based, no libc
         │
         ├──► Worker 0         own address space, seccomp-filtered
@@ -29,7 +29,7 @@ GHC Process (Haskell)
 
 A minimal C supervisor (~600 lines, musl static-PIE, no libc) is embedded in the Haskell binary at compile time. Sandboxed execution contexts are pre-warmed so that dispatch is a memfd write + futex wake — no process spawn on the hot path.
 
-**Dispatch latency**: ~3-5 microseconds, comparable to GHC's native `ccall` FFI overhead.
+**Dispatch latency**: ~5-6 microseconds, comparable to GHC's native `ccall` FFI overhead.
 
 ## Quick start
 
@@ -86,18 +86,17 @@ The pool's `InjectionCapability` determines how workers set up their code region
 Requires Nix. The flake provides GHC, musl cross-compiler, LLVM 19, and all Haskell dependencies.
 
 ```bash
-# Enter dev shell
-nix develop
+# Full build (fork server compiles automatically via TH)
+nix build .#hatchery
 
-# Build the fork server (must run before cabal build)
-make -C hatchery/cbits
+# Interactive development
+nix develop -c cabal build all
 
-# Build all packages
-cabal build all
-
-# Run tests
-cabal test hatchery-test
+# Run the bench/test binary (built by nix build)
+result/bin/hatchery-bench
 ```
+
+The fork server binary is compiled at Template Haskell time via `$HATCHERY_CC` (musl cross-compiler, set automatically by the nix flake). No separate build step needed.
 
 ## Platform requirements
 
@@ -113,7 +112,7 @@ cabal test hatchery-test
 
 ## Status
 
-Phase 1 is complete: core sandbox works end-to-end with both injection methods. See `PLAN.md` for the full roadmap.
+Phase 1 is complete: core sandbox works end-to-end with both injection methods and crash detection. See `PLAN.md` for the full roadmap.
 
 **Not yet implemented**: worker respawn on crash, PID namespace isolation (`CLONE_NEWPID`), dispatch timeout enforcement, LLVM codegen (stubbed).
 
