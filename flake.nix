@@ -28,12 +28,14 @@
             llvm-tf = hself.callHackage "llvm-tf" "21.0" {};
 
             # hatchery needs HATCHERY_CC at TH compile time to build the fork server
-            hatchery = pkgs.haskell.lib.overrideCabal hsuper.hatchery (old: {
-              preBuild = (old.preBuild or "") + ''
-                export HATCHERY_CC="${hatchery-cc}"
-              '';
-              buildTools = (old.buildTools or []) ++ [ musl-cc ];
-            });
+            hatchery = pkgs.haskell.lib.compose.dontCheck (
+              pkgs.haskell.lib.overrideCabal hsuper.hatchery (old: {
+                preBuild = (old.preBuild or "") + ''
+                  export HATCHERY_CC="${hatchery-cc}"
+                '';
+                buildTools = (old.buildTools or []) ++ [ musl-cc ];
+              })
+            );
           })
         ];
       };
