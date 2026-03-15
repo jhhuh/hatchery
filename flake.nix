@@ -10,21 +10,22 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       musl-cc = pkgs.pkgsStatic.stdenv.cc;
+      llvm = pkgs.llvmPackages_19.llvm;
 
       hsPkgs = pkgs.haskellPackages.override {
         overrides = pkgs.lib.composeManyExtensions [
-          # Local packages
           (pkgs.haskell.lib.packageSourceOverrides {
             hatchery      = ./hatchery;
             hatchery-llvm = ./hatchery-llvm;
             trustless-ffi = ./trustless-ffi;
           })
-          # Pinned Hackage versions
           (hself: hsuper: {
-            llvm-ffi = hself.callHackage "llvm-ffi" "21.0.0.2" {
-              LLVM = pkgs.llvmPackages_19.llvm;
-            };
-            llvm-tf  = hself.callHackage "llvm-tf"  "21.0" {};
+            # Follow nixpkgs pattern from configuration-nix.nix:
+            # pass LLVM = null, add .lib and .dev as build deps separately
+            llvm-ffi = pkgs.haskell.lib.compose.addBuildDepends
+              [ llvm.lib llvm.dev ]
+              (hself.callHackage "llvm-ffi" "21.0.0.2" { LLVM = null; });
+            llvm-tf = hself.callHackage "llvm-tf" "21.0" {};
           })
         ];
       };
@@ -34,7 +35,7 @@
         buildInputs = [
           pkgs.cabal-install
           musl-cc
-          pkgs.llvmPackages_19.llvm
+          llvm
           pkgs.nasm
           pkgs.overmind
           pkgs.tmux
