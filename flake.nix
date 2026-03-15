@@ -10,6 +10,7 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       musl-cc = pkgs.pkgsStatic.stdenv.cc;
+      hatchery-cc = "${musl-cc}/bin/x86_64-unknown-linux-musl-gcc";
       llvm = pkgs.llvmPackages_19.llvm;
 
       hsPkgs = pkgs.haskellPackages.override {
@@ -20,12 +21,19 @@
             trustless-ffi = ./trustless-ffi;
           })
           (hself: hsuper: {
-            # Follow nixpkgs pattern from configuration-nix.nix:
-            # pass LLVM = null, add .lib and .dev as build deps separately
+            # llvm-ffi: follow nixpkgs pattern — LLVM = null, add .lib/.dev
             llvm-ffi = pkgs.haskell.lib.compose.addBuildDepends
               [ llvm.lib llvm.dev ]
               (hself.callHackage "llvm-ffi" "21.0.0.2" { LLVM = null; });
             llvm-tf = hself.callHackage "llvm-tf" "21.0" {};
+
+            # hatchery needs HATCHERY_CC at TH compile time to build the fork server
+            hatchery = pkgs.haskell.lib.overrideCabal hsuper.hatchery (old: {
+              preBuild = (old.preBuild or "") + ''
+                export HATCHERY_CC="${hatchery-cc}"
+              '';
+              buildTools = (old.buildTools or []) ++ [ musl-cc ];
+            });
           })
         ];
       };
@@ -41,10 +49,16 @@
           pkgs.tmux
         ];
         shellHook = ''
-          export MUSL_CC="${musl-cc}/bin/x86_64-unknown-linux-musl-gcc"
+          export HATCHERY_CC="${hatchery-cc}"
         '';
       };
     in {
+      packages.${system} = {
+        hatchery      = hsPkgs.hatchery;
+        hatchery-llvm = hsPkgs.hatchery-llvm;
+        trustless-ffi = hsPkgs.trustless-ffi;
+        default       = hsPkgs.hatchery;
+      };
       devShells.${system}.default = haskellShell;
     };
 }

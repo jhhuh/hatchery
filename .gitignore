@@ -8,3 +8,4 @@ result-*
 fork_server
 worker_template
 .direnv/
+hatchery/cbits/fork_server.tmp

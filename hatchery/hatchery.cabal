@@ -11,6 +11,7 @@ library
     Hatchery.Core
     Hatchery.Dispatch
   other-modules:
+    Hatchery.Internal.Compile
     Hatchery.Internal.Memfd
     Hatchery.Internal.Vfork
     Hatchery.Internal.Protocol
@@ -20,7 +21,9 @@ library
     bytestring,
     async,
     unix,
-    file-embed
+    template-haskell,
+    process,
+    directory
   hs-source-dirs: src
   c-sources:
     cbits/vfork_helper.c

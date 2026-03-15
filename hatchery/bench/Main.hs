@@ -2,9 +2,9 @@ module Main where
 
 import Hatchery
 import qualified Data.ByteString as BS
-import Data.Int (Int32)
 import System.CPUTime
 import Text.Printf (printf)
+import System.IO (hSetBuffering, stdout, BufferMode(..))
 
 -- | Raw x86_64: mov eax, 42; ret
 payload :: BS.ByteString
