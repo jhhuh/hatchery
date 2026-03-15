@@ -152,8 +152,9 @@ static void __attribute__((noreturn)) worker_main(int ring_fd, int code_fd,
     if (code_fd >= 0)
         sys_close(code_fd);
 
-    /* PR_SET_DUMPABLE=0: no core dumps, no /proc/pid/mem access by peers */
-    sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    /* NOTE: PR_SET_DUMPABLE=0 is intentionally omitted here.
+     * Setting it would block process_vm_writev from the fork server.
+     * Seccomp provides the main sandbox; dumpable is a secondary hardening. */
 
     /* Publish code region address in ring buffer */
     ring->code_base = (uint64_t)(unsigned long)code_base;
@@ -376,22 +377,37 @@ static void handle_dispatch(const struct command *cmd)
         if (st == WORKER_DONE)
             break;
         if (st == WORKER_CRASHED || w->pid <= 0) {
-            /* Worker crashed */
-            struct response rsp;
-            simple_memset(&rsp, 0, sizeof(rsp));
-            rsp.type = RSP_WORKER_CRASHED;
-            rsp.worker_crashed.worker_id = (uint32_t)idx;
-            rsp.worker_crashed.signal = 0;
-            send_response(&rsp);
-            w->busy = 0;
-            return;
+            goto worker_crashed;
         }
-        /* Wait on notify futex */
+        /* Check if worker process is still alive */
+        if (sys_kill(w->pid, 0) < 0) {
+            goto worker_crashed;
+        }
+        /* Wait on notify futex with timeout (100ms) to recheck liveness */
         uint32_t nv = atomic_load_explicit(&w->ring->notify,
                                             memory_order_acquire);
-        if (nv == 0)
-            futex_wait(&w->ring->notify, 0);
+        if (nv == 0) {
+            struct { long tv_sec; long tv_nsec; } ts = { 0, 100000000L };
+            sys_futex((uint32_t *)&w->ring->notify, 0 /*FUTEX_WAIT*/, 0,
+                      &ts, 0, 0);
+        }
     }
+    goto worker_done;
+
+worker_crashed:
+    {
+        struct response rsp;
+        simple_memset(&rsp, 0, sizeof(rsp));
+        rsp.type = RSP_WORKER_CRASHED;
+        rsp.worker_crashed.worker_id = (uint32_t)idx;
+        rsp.worker_crashed.signal = 0;
+        send_response(&rsp);
+        w->busy = 0;
+        w->pid = 0;
+        return;
+    }
+worker_done:
+    (void)0;
 
     /* Reset notify */
     atomic_store_explicit(&w->ring->notify, 0, memory_order_release);
