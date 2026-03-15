@@ -15,6 +15,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Foreign.Storable
 import Foreign.Ptr
+import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Utils (fillBytes)
 import Data.Word
@@ -138,7 +139,7 @@ sendCommand fd cmd = allocaBytes commandSize $ \buf -> do
       writeAll fd buf commandSize
       -- Send code bytes immediately after
       let (fptr, off, clen) = BSI.toForeignPtr codeBytes
-      BSI.withForeignPtr fptr $ \p ->
+      withForeignPtr fptr $ \p ->
         writeAll fd (p `plusPtr` off) clen
     CmdStatus -> do
       pokeW32 buf 0 2  -- CMD_STATUS
