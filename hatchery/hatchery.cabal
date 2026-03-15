@@ -16,6 +16,7 @@ library
     Hatchery.Internal.Vfork
     Hatchery.Internal.Protocol
     Hatchery.Internal.Embedded
+    Hatchery.Internal.SpinWait
   build-depends:
     base >= 4.16 && < 5,
     bytestring,
@@ -23,7 +24,8 @@ library
     unix,
     template-haskell,
     process,
-    directory
+    directory,
+    inline-cmm
   hs-source-dirs: src
   c-sources:
     cbits/vfork_helper.c
