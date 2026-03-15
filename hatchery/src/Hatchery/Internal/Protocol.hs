@@ -11,7 +11,6 @@ module Hatchery.Internal.Protocol
   ) where
 
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Foreign.Storable
 import Foreign.Ptr
@@ -100,9 +99,6 @@ pokeW32 base off val = pokeByteOff (castPtr base) off val
 
 peekW32 :: Ptr Word8 -> Int -> IO Word32
 peekW32 base off = peekByteOff (castPtr base) off
-
-pokeI32 :: Ptr Word8 -> Int -> Int32 -> IO ()
-pokeI32 base off val = pokeByteOff (castPtr base) off val
 
 peekI32 :: Ptr Word8 -> Int -> IO Int32
 peekI32 base off = peekByteOff (castPtr base) off

@@ -58,6 +58,10 @@ static int injection_cap;
 static unsigned long code_region_size;
 static unsigned long ring_buf_size;
 
+/* ── Forward declarations ───────────────────────────────────────────── */
+
+static void wake_and_wait(int idx);
+
 /* ── String/memory helpers ───────────────────────────────────────────── */
 
 static int simple_atoi(const char *s)
