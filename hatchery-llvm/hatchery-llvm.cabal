@@ -9,8 +9,9 @@ library
     Hatchery.LLVM
   build-depends:
     base >= 4.16 && < 5,
-    bytestring
-    -- llvm-tf >= 16.0  -- deferred until LLVM C headers available in devShell
+    bytestring,
+    llvm-tf >= 21.0,
+    llvm-ffi >= 21.0
   hs-source-dirs: src
   default-language: Haskell2010
   ghc-options: -Wall
