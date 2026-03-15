@@ -36,6 +36,7 @@ compileForkServer = do
   runIO $ do
     tmp <- makeAbsolute "cbits/fork_server.tmp"
     let args = [ "-static-pie", "-nostartfiles", "-fPIE", "-Os"
+               , "-fno-stack-protector"
                , "-Wall", "-Werror"
                , "-o", tmp
                , "cbits/fork_server.c", "cbits/seccomp_filter.c"
