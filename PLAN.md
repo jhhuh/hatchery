@@ -179,13 +179,15 @@ Measured dispatch latency: ~5-6μs (excluding code execution time)
 ### Latency Reference (measured, same `return 42` workload)
 
 ```
-unsafe ccall:          ~0.00 us/call  (below CPUTime resolution)
-safe ccall:            ~0.07 us/call
-hatchery (vm_writev):  ~5.18 us/call  (includes code injection every dispatch)
-hatchery (memfd):      ~5.84 us/call  (includes code injection every dispatch)
+unsafe ccall:              <0.01 us/call
+safe ccall:                ~0.08 us/call
+hatchery (pre-loaded):     ~3.08 us/call  (direct futex, no fork server relay)
+hatchery (vm_writev):      ~5.23 us/call  (code injection every dispatch)
+hatchery (memfd):          ~5.96 us/call  (code injection every dispatch)
+hatchery (spin-wait):       TBD          (theoretical: ~0.1-0.5 us, zero syscalls)
 ```
 
-**TODO**: Measure `foreign import prim` baseline. Add a "re-run same code" dispatch mode (skip injection) to isolate pure futex round-trip overhead — that's the fair comparison point against FFI.
+**TODO**: Measure `foreign import prim` baseline. Implement spin-wait mode for latency-critical pre-loaded workers.
 
 ## Implementation Status
 
@@ -246,11 +248,26 @@ All core primitives working end-to-end: fork server spawn, worker pool, dual inj
 
 ## Architecture Decisions (Open)
 
-1. **Direct memfd writes from Haskell**: Current implementation serializes code bytes through the socketpair (fork server reads them, then writes to memfd/worker). Original design intended Haskell to write directly to the code memfd, with socketpair carrying only control signals. Requires passing memfd fds back to Haskell (via SCM_RIGHTS, pidfd_getfd, or creating memfds on Haskell side).
+1. **Direct memfd writes from Haskell**: Current `dispatch` still serializes code bytes through the socketpair. `prepare` already uses `pidfd_getfd` to get the memfds — extending `dispatch` to write directly to the code memfd would eliminate the socketpair payload overhead for one-shot dispatches too.
 
 2. **Worker respawn strategy**: Simple fork() from fork server? Or snapshot a "template" worker and clone it? Fork is simplest for Phase 2.
 
 3. **Timeout mechanism**: timerfd per dispatch? SIGALRM? Futex with timeout? timerfd is cleanest (integrates with epoll).
+
+4. **Spin-wait mode for pre-loaded workers**: Replace futex wake/wait with spin-loops on both sides (worker spins on `control`, Haskell spins on `status`). Zero syscalls on the hot path — latency drops to cache-line invalidation time (~100-500ns). Tradeoff: burns a CPU core per spinning side. Offer as opt-in mode for latency-critical workloads. Worker side: `while (atomic_load(control) == IDLE) { _mm_pause(); }`. Haskell side: `while (atomic_load(status) != DONE) { _mm_pause(); }`.
+
+5. **ResourceT integration for runtime foreign function registration**: The bracket-based `withPrepared` forces nesting. A `ResourceT` API would let users register sandbox-backed foreign functions flat — natural for applications that discover or compile foreign code dynamically (plugins, JIT, REPL). Each `prepare` returns a key; all are auto-released at scope exit. This effectively gives `foreign import ccall` semantics at runtime: prepare a function once, call it many times, release when done — but with process isolation.
+
+   ```haskell
+   runResourceT $ do
+     (run42, _) <- allocate (prepare h UseSharedMemfd code42) release
+     (runFib, _) <- allocate (prepare h UseSharedMemfd codeFib) release
+     -- Use like regular functions; auto-released at scope exit
+     liftIO $ do
+       a <- run run42
+       b <- run runFib
+       ...
+   ```
 
 ## Platform Requirements
 
