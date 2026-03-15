@@ -17,10 +17,11 @@
 #define RING_CONTROL_OFF    0
 #define RING_NOTIFY_OFF    64
 #define RING_STATUS_OFF   128
-#define RING_EXIT_CODE_OFF 216
-#define RING_RESULT_OFF_OFF 220
-#define RING_RESULT_SIZE_OFF 224
-#define RING_DATA_OFF      256
+#define RING_SPIN_MODE_OFF 160
+#define RING_EXIT_CODE_OFF 164
+#define RING_RESULT_OFF_OFF 168
+#define RING_RESULT_SIZE_OFF 172
+#define RING_DATA_OFF      192
 
 /* Worker states */
 #define WORKER_IDLE  0
@@ -120,6 +121,11 @@ void hatchery_atomic_write32(void *addr, uint32_t val)
     __atomic_store_n((uint32_t *)addr, val, __ATOMIC_SEQ_CST);
 }
 
+void hatchery_release_write32(void *addr, uint32_t val)
+{
+    __atomic_store_n((uint32_t *)addr, val, __ATOMIC_RELEASE);
+}
+
 /* Spin-wait on ring buffer status. Returns:
  *  0 = done (exit_code written to *out_exit_code)
  *  1 = crashed
@@ -136,14 +142,21 @@ int hatchery_spin_wait_c(void *ring_base, uint32_t spin_count, int32_t *out_exit
         uint32_t st = __atomic_load_n(status, __ATOMIC_SEQ_CST);
         if (st == WORKER_DONE) {
             *out_exit_code = __atomic_load_n(ec_ptr, __ATOMIC_SEQ_CST);
-            __atomic_store_n(notify, 0, __ATOMIC_SEQ_CST);
-            __atomic_store_n(status, WORKER_READY, __ATOMIC_SEQ_CST);
+            __atomic_store_n(notify, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(status, WORKER_READY, __ATOMIC_RELEASE);
             return 0;
         }
         if (st == 4 /* WORKER_CRASHED */)
             return 1;
     }
     return 2;
+}
+
+/* Set spin_mode flag in ring buffer */
+void hatchery_set_spin_mode(void *ring_base, uint32_t mode)
+{
+    uint32_t *sm = (uint32_t *)((char *)ring_base + RING_SPIN_MODE_OFF);
+    *sm = mode;
 }
 
 /* Read result_size from ring buffer */

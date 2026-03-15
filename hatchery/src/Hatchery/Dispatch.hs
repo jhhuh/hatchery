@@ -82,6 +82,9 @@ foreign import ccall "hatchery_result_data"
 foreign import ccall unsafe "hatchery_spin_wait_c"
   c_spin_wait :: Ptr () -> Word32 -> Ptr Int32 -> IO CInt
 
+foreign import ccall "hatchery_set_spin_mode"
+  c_set_spin_mode :: Ptr () -> Word32 -> IO ()
+
 foreign import ccall safe "hatchery_futex_wait_safe"
   c_futex_wait_safe :: Ptr () -> IO CInt
 
@@ -190,6 +193,14 @@ prepare h method codeBytes = do
       sendCommand (hSockFd h) cmd
       _ <- handleResponse h
 
+      -- Enable spin_mode after the first dispatch completes.
+      -- The first dispatch goes through the fork server (which needs futex_wake).
+      -- Subsequent runs go direct — worker can skip futex_wake.
+      case waitStrategy (hConfig h) of
+        SpinWait _  -> c_set_spin_mode ringPtr 1
+        SpinWaitC _ -> c_set_spin_mode ringPtr 1
+        _           -> return ()
+
       return pw
 
 -- | Re-run pre-loaded code on a prepared worker.
@@ -264,6 +275,8 @@ readResult pw ecPtr = do
 -- | Release a reserved worker back to the pool.
 release :: PreparedWorker -> IO ()
 release pw = do
+  -- Clear spin_mode before releasing
+  c_set_spin_mode (pwRingPtr pw) 0
   -- Unmap ring buffer
   _ <- c_munmap_ring (pwRingPtr pw) (fromIntegral (pwRingSize pw))
   -- Close local fds

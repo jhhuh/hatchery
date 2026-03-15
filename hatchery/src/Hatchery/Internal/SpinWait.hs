@@ -21,7 +21,8 @@ include "\"Cmm.h\""
 --   control:    0     (cache line 0)
 --   notify:    64     (cache line 1)
 --   status:   128     (cache line 2)
---   exit_code: 216
+--   spin_mode: 160
+--   exit_code: 164
 
 -- Worker status values:
 --   WORKER_READY   = 1
@@ -50,10 +51,10 @@ verbatim "\
 \\n\
 \done:\n\
 \    W_ ec;\n\
-\    (ec) = ccall hatchery_atomic_read32(ring_base + 216);\n\
+\    (ec) = ccall hatchery_atomic_read32(ring_base + 164);\n\
 \\n\
-\    ccall hatchery_atomic_write32(ring_base + 64, 0);\n\
-\    ccall hatchery_atomic_write32(status_addr, 1);\n\
+\    ccall hatchery_release_write32(ring_base + 64, 0);\n\
+\    ccall hatchery_release_write32(status_addr, 1);\n\
 \\n\
 \    return (0, ec);\n\
 \\n\

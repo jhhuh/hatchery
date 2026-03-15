@@ -222,7 +222,8 @@ static void __attribute__((noreturn)) worker_main(int ring_fd, int code_fd,
 
         /* Wake parent */
         atomic_store_explicit(&ring->notify, 1, memory_order_release);
-        futex_wake(&ring->notify, 1);
+        if (!ring->spin_mode)
+            futex_wake(&ring->notify, 1);
     }
 }
 
@@ -515,6 +516,8 @@ static void handle_reserve(const struct command *cmd)
 
     workers[idx].reserved = 1;
 
+    /* spin_mode is set by Haskell after prepare's initial dispatch completes */
+
     /* Keep pidfd in epoll — fork server writes CRASHED to ring on death */
 
     /* Temporarily set dumpable so Haskell can pidfd_getfd our memfds */
@@ -536,6 +539,7 @@ static void handle_release(const struct command *cmd)
     int idx = (int)cmd->reserve_release.worker_id;
     if (idx >= 0 && idx < pool_size) {
         workers[idx].reserved = 0;
+        workers[idx].ring->spin_mode = 0;
         /* pidfd already in epoll — no re-add needed */
     }
 }

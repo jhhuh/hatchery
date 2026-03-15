@@ -39,6 +39,10 @@ struct ring_buffer {
     uint32_t injection_method;   /* which method was used */
     uint32_t code_len;           /* actual length of injected code */
 
+    /* Spin mode: set by fork server when worker is reserved + spin_count > 0.
+     * Worker skips futex_wake on notify when set. */
+    uint32_t spin_mode;
+
     /* Result (written by worker) */
     int32_t  exit_code;
     uint32_t result_offset;      /* offset into data[] for result */
