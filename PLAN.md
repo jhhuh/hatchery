@@ -180,12 +180,13 @@ Measured dispatch latency: ~5-6μs (excluding code execution time)
 
 ```
 foreign import prim:       0.3 ns   (register shuffle, no stack frame)
-unsafe ccall:              1.2 ns   (C ABI overhead)
-safe ccall:               68.8 ns   (releases GHC capability)
-hatchery (spin-wait):    553   ns   (Cmm spin + cross-process round-trip)
-hatchery (pre-loaded):  3073   ns   (direct futex, no fork server relay)
-hatchery (memfd):       6030   ns   (code injection + fork server relay)
-hatchery (vm_writev):   6108   ns   (code injection + fork server relay)
+unsafe ccall:              1.4 ns   (C ABI overhead)
+safe ccall:               67.0 ns   (releases GHC capability)
+hatchery (spin-wait Cmm): 349  ns   (zero syscalls, cache-line round-trip)
+hatchery (spin-wait C):   391  ns   (zero syscalls, cache-line round-trip)
+hatchery (pre-loaded):   3105  ns   (direct futex, no fork server relay)
+hatchery (vm_writev):    5561  ns   (code injection + fork server relay)
+hatchery (memfd):        6231  ns   (code injection + fork server relay)
 ```
 
 **Measured** with `inline-cmm` prim baseline. See devlog for detailed interpretation.
