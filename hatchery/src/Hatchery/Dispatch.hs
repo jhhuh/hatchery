@@ -76,6 +76,9 @@ foreign import ccall safe "hatchery_futex_wait_safe"
 foreign import ccall "hatchery_write_code"
   c_write_code :: Ptr () -> Ptr () -> Ptr Word8 -> Word32 -> IO ()
 
+foreign import ccall "hatchery_set_spin_mode"
+  c_set_spin_mode :: Ptr () -> Word32 -> IO ()
+
 -- | Take an idle worker from the pool. Returns Nothing if none available.
 takeWorker :: MVar [Word32] -> IO (Maybe Word32)
 takeWorker mv = do
@@ -98,9 +101,23 @@ findWorker ref wid = do
     (w:_) -> return w
     []    -> ioError (userError $ "findWorker: unknown worker " ++ show wid)
 
--- | Core wake+wait logic shared by dispatch and run.
-runDirect :: Hatchery -> Ptr () -> Int -> IO DispatchResult
-runDirect h ringPtr workerPid = do
+-- | Wake worker via futex + spin-wait on Haskell side.
+-- Always uses futex_wake to be safe regardless of worker state (worker
+-- may have fallen back from spin to futex_wait). Used by dispatch and
+-- prepare's initial run.
+runDirectFutexWake :: Hatchery -> Ptr () -> Int -> IO DispatchResult
+runDirectFutexWake h ringPtr workerPid = do
+  c_wake_worker ringPtr  -- always futex_wake
+  case waitStrategy (hConfig h) of
+    FutexWait   -> waitFutex ringPtr workerPid
+    SpinWait n  -> waitSpin ringPtr n
+    SpinWaitC n -> waitSpinC ringPtr n
+
+-- | Wake worker via release-store only (no futex_wake) + spin-wait.
+-- Only safe when worker is guaranteed to be spinning (after prepare has
+-- done one successful run and set spin_mode=1).
+runDirectSpinWake :: Hatchery -> Ptr () -> Int -> IO DispatchResult
+runDirectSpinWake h ringPtr workerPid = do
   case waitStrategy (hConfig h) of
     FutexWait   -> c_wake_worker ringPtr >> waitFutex ringPtr workerPid
     SpinWait n  -> c_wake_worker_spin ringPtr >> waitSpin ringPtr n
@@ -187,8 +204,8 @@ dispatch h _method codeBytes = do
   withForeignPtr fptr $ \p ->
     c_write_code (wmRingPtr wm) (wmCodePtr wm) (p `plusPtr` off) (fromIntegral len)
 
-  -- Wake and wait (same path as run)
-  result <- runDirect h (wmRingPtr wm) (wmWorkerPid wm)
+  -- Wake (always futex_wake — worker may be in futex_wait) and wait
+  result <- runDirectFutexWake h (wmRingPtr wm) (wmWorkerPid wm)
 
   -- Return worker to idle set (unless crashed)
   case result of
@@ -218,13 +235,20 @@ prepare h _method codeBytes = do
   withForeignPtr fptr $ \p ->
     c_write_code (wmRingPtr wm) (wmCodePtr wm) (p `plusPtr` off) (fromIntegral len)
 
-  -- Run once to verify code loads correctly
-  result <- runDirect h (wmRingPtr wm) (wmWorkerPid wm)
+  -- Run once with futex_wake (safe — worker may be in futex_wait)
+  result <- runDirectFutexWake h (wmRingPtr wm) (wmWorkerPid wm)
   case result of
     Crashed _ -> do
       -- Worker crashed during initial run — don't return to pool
       throwIO HatcheryDead
     _ -> return ()
+
+  -- Now worker is in its spin loop. Enable spin_mode so worker
+  -- skips futex_wake on its notify writes.
+  case waitStrategy (hConfig h) of
+    SpinWait _  -> c_set_spin_mode (wmRingPtr wm) 1
+    SpinWaitC _ -> c_set_spin_mode (wmRingPtr wm) 1
+    _           -> return ()
 
   return PreparedWorker
     { pwHatchery = h
@@ -233,9 +257,10 @@ prepare h _method codeBytes = do
     }
 
 -- | Re-run pre-loaded code on a prepared worker.
--- Direct Haskell↔worker path: no socketpair, no fork server.
+-- Uses spin-wake (no futex_wake) when spin_mode is enabled — safe because
+-- prepare's initial run guarantees the worker is in its spin loop.
 run :: PreparedWorker -> IO DispatchResult
-run pw = runDirect (pwHatchery pw) (wmRingPtr (pwMapping pw)) (wmWorkerPid (pwMapping pw))
+run pw = runDirectSpinWake (pwHatchery pw) (wmRingPtr (pwMapping pw)) (wmWorkerPid (pwMapping pw))
 
 -- | Release a prepared worker back to the idle pool.
 release :: PreparedWorker -> IO ()

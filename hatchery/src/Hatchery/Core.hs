@@ -170,11 +170,10 @@ withHatchery cfg action = inBoundThread $
                   return p
           else return nullPtr
 
-        -- Enable spin_mode if configured
-        case waitStrategy cfg of
-          SpinWait _  -> c_set_spin_mode ringPtr 1
-          SpinWaitC _ -> c_set_spin_mode ringPtr 1
-          _           -> return ()
+        -- NOTE: do NOT set spin_mode here. Workers may have already
+        -- fallen back to futex_wait after exhausting their spin count.
+        -- spin_mode is set by prepare after the first successful run
+        -- (which uses futex_wake to safely wake the worker).
 
         return WorkerMapping
           { wmWorkerId  = wid
