@@ -25,9 +25,8 @@ import Foreign.Storable (peek)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.C.Types
 
-import Hatchery.Config (InjectionCapability(..), InjectionMethod(..), HatcheryConfig(..), WaitStrategy(..))
+import Hatchery.Config (InjectionCapability(..), InjectionMethod, HatcheryConfig(..), WaitStrategy(..))
 import Hatchery.Core (Hatchery(..), WorkerMapping(..))
-import Hatchery.Internal.Protocol
 import Hatchery.Internal.SpinWait (spinWait)
 
 data DispatchResult
@@ -53,18 +52,6 @@ data PreparedWorker = PreparedWorker
   }
 
 -- FFI imports for direct dispatch
-foreign import ccall "hatchery_pidfd_open"
-  c_pidfd_open :: CInt -> IO CInt
-
-foreign import ccall "hatchery_pidfd_getfd"
-  c_pidfd_getfd :: CInt -> CInt -> IO CInt
-
-foreign import ccall "hatchery_mmap_ring"
-  c_mmap_ring :: CInt -> CULong -> IO (Ptr ())
-
-foreign import ccall "hatchery_munmap_ring"
-  c_munmap_ring :: Ptr () -> CULong -> IO CInt
-
 foreign import ccall "hatchery_wake_worker"
   c_wake_worker :: Ptr () -> IO ()
 
@@ -83,43 +70,11 @@ foreign import ccall "hatchery_result_data"
 foreign import ccall unsafe "hatchery_spin_wait_c"
   c_spin_wait :: Ptr () -> Word32 -> Ptr Int32 -> IO CInt
 
-foreign import ccall "hatchery_set_spin_mode"
-  c_set_spin_mode :: Ptr () -> Word32 -> IO ()
-
 foreign import ccall safe "hatchery_futex_wait_safe"
   c_futex_wait_safe :: Ptr () -> IO CInt
 
 foreign import ccall "hatchery_write_code"
   c_write_code :: Ptr () -> Ptr () -> Ptr Word8 -> Word32 -> IO ()
-
-foreign import ccall "close"
-  c_close :: CInt -> IO CInt
-
--- | Validate that the requested injection method is compatible with pool capability.
-validateMethod :: InjectionCapability -> InjectionMethod -> Bool
-validateMethod BothMethods         _                  = True
-validateMethod ProcessVmWritevOnly UseProcessVmWritev = True
-validateMethod SharedMemfdOnly     UseSharedMemfd     = True
-validateMethod _                   _                  = False
-
-methodToWire :: InjectionMethod -> InjectionMethodWire
-methodToWire UseProcessVmWritev = WireProcessVmWritev
-methodToWire UseSharedMemfd     = WireSharedMemfd
-
--- | Handle a dispatch/run response from the fork server.
-handleResponse :: Hatchery -> IO DispatchResult
-handleResponse h = do
-  rsp <- recvResponse (hSockFd h)
-  case rsp of
-    RspWorkerDone done mdata ->
-      return $ Completed (wdExitCode done) mdata
-    RspWorkerCrashed crashed ->
-      return $ Crashed (wcSignal crashed)
-    RspError code ->
-      if code == -1
-        then throwIO NoAvailableWorker
-        else throwIO HatcheryDead
-    _ -> ioError (userError $ "dispatch: unexpected response: " ++ show rsp)
 
 -- | Take an idle worker from the pool. Returns Nothing if none available.
 takeWorker :: MVar [Word32] -> IO (Maybe Word32)
@@ -242,94 +197,49 @@ dispatch h _method codeBytes = do
 
   return result
 
--- | Reserve a worker, inject code, and run it once.
--- The worker is reserved from the pool and can be re-run via 'run'.
--- The ring buffer is mmap'd into the Haskell process for direct access.
+-- | Take an idle worker from the pool, inject code, and return a handle
+-- for repeated re-runs. The worker is removed from the idle set until
+-- 'release' returns it.
 prepare :: Hatchery -> InjectionMethod -> ByteString -> IO PreparedWorker
-prepare h method codeBytes = do
+prepare h _method codeBytes = do
   let cap = injectionCapability (hConfig h)
-  if not (validateMethod cap method)
-    then throwIO IncompatibleInjectionMethod
-    else do
-      -- Reserve an idle worker
-      sendCommand (hSockFd h) (CmdReserve maxBound)
-      rsp <- recvResponse (hSockFd h)
-      (wid, remoteRingFd, remoteCodeFd, workerPid) <- case rsp of
-        RspWorkerReserved wid rfd cfd wpid ->
-          return (wid, rfd, cfd, wpid)
-        RspError code ->
-          if code == -1
-            then throwIO NoAvailableWorker
-            else throwIO HatcheryDead
-        _ -> ioError (userError $ "prepare: unexpected response: " ++ show rsp)
+  when (cap == ProcessVmWritevOnly) $
+    throwIO IncompatibleInjectionMethod
 
-      -- Duplicate fork server's fds into our process via pidfd_getfd
-      fsPidfd <- c_pidfd_open (fromIntegral (hPid h))
-      when (fsPidfd < 0) $ ioError (userError "prepare: pidfd_open failed")
-      localRingFd <- c_pidfd_getfd fsPidfd (fromIntegral remoteRingFd)
-      when (localRingFd < 0) $ ioError (userError "prepare: pidfd_getfd ring_fd failed")
-      localCodeFd <- if remoteCodeFd >= 0
-        then do fd <- c_pidfd_getfd fsPidfd (fromIntegral remoteCodeFd)
-                when (fd < 0) $ ioError (userError "prepare: pidfd_getfd code_fd failed")
-                return fd
-        else return (-1)
-      _ <- c_close fsPidfd
+  mwid <- takeWorker (hIdleWorkers h)
+  wid <- case mwid of
+    Nothing -> throwIO NoAvailableWorker
+    Just w  -> return w
 
-      -- mmap the ring buffer
-      let rbSize = ringBufSize (hConfig h)
-      ringPtr <- c_mmap_ring localRingFd (fromIntegral rbSize)
-      when (ringPtr == nullPtr `plusPtr` (-1)) $ ioError (userError "prepare: mmap failed")
+  wm <- findWorker (hWorkerInfo h) wid
 
-      let pw = PreparedWorker
-            { pwHatchery  = h
-            , pwWorkerId  = wid
-            , pwRingPtr   = ringPtr
-            , pwRingSize  = rbSize
-            , pwWorkerPid = fromIntegral workerPid
-            , pwRingFd    = localRingFd
-            , pwCodeFd    = localCodeFd
-            }
+  -- Write code directly to mmap'd memfd
+  let (fptr, off, len) = BSI.toForeignPtr codeBytes
+  withForeignPtr fptr $ \p ->
+    c_write_code (wmRingPtr wm) (wmCodePtr wm) (p `plusPtr` off) (fromIntegral len)
 
-      -- First dispatch via fork server to inject code
-      let cmd = CmdDispatch
-            (DispatchCmd
-              { dcWorkerId = wid
-              , dcInjectionMethod = methodToWire method
-              , dcCodeLen = fromIntegral (BS.length codeBytes)
-              })
-            codeBytes
-      sendCommand (hSockFd h) cmd
-      _ <- handleResponse h
+  -- Run once to verify code loads correctly
+  result <- runDirect h (wmRingPtr wm) (wmWorkerPid wm)
+  case result of
+    Crashed _ -> do
+      -- Worker crashed during initial run — don't return to pool
+      throwIO HatcheryDead
+    _ -> return ()
 
-      -- Enable spin_mode after the first dispatch completes.
-      -- The first dispatch goes through the fork server (which needs futex_wake).
-      -- Subsequent runs go direct — worker can skip futex_wake.
-      case waitStrategy (hConfig h) of
-        SpinWait _  -> c_set_spin_mode ringPtr 1
-        SpinWaitC _ -> c_set_spin_mode ringPtr 1
-        _           -> return ()
-
-      return pw
+  return PreparedWorker
+    { pwHatchery = h
+    , pwWorkerId = wid
+    , pwMapping  = wm
+    }
 
 -- | Re-run pre-loaded code on a prepared worker.
 -- Direct Haskell↔worker path: no socketpair, no fork server.
 run :: PreparedWorker -> IO DispatchResult
-run pw = runDirect (pwHatchery pw) (pwRingPtr pw) (pwWorkerPid pw)
+run pw = runDirect (pwHatchery pw) (wmRingPtr (pwMapping pw)) (wmWorkerPid (pwMapping pw))
 
--- | Release a reserved worker back to the pool.
+-- | Release a prepared worker back to the idle pool.
 release :: PreparedWorker -> IO ()
-release pw = do
-  -- Clear spin_mode before releasing
-  c_set_spin_mode (pwRingPtr pw) 0
-  -- Unmap ring buffer
-  _ <- c_munmap_ring (pwRingPtr pw) (fromIntegral (pwRingSize pw))
-  -- Close local fds
-  _ <- c_close (pwRingFd pw)
-  if pwCodeFd pw >= 0
-    then c_close (pwCodeFd pw) >> return ()
-    else return ()
-  -- Tell fork server to release
-  sendCommand (hSockFd (pwHatchery pw)) (CmdRelease (pwWorkerId pw))
+release pw = putWorker (hIdleWorkers (pwHatchery pw)) (pwWorkerId pw)
 
 -- | Bracket pattern: prepare, run action, release.
 withPrepared :: Hatchery -> InjectionMethod -> ByteString
