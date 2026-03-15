@@ -58,6 +58,7 @@ static int injection_cap;
 static unsigned long code_region_size;
 static unsigned long ring_buf_size;
 static int epfd;                /* epoll fd */
+static int dumpable_window;     /* set after CMD_RESERVE, cleared on next command */
 
 /* ── Forward declarations ───────────────────────────────────────────── */
 
@@ -504,12 +505,16 @@ static void handle_reserve(const struct command *cmd)
     if (workers[idx].pidfd >= 0)
         sys_epoll_ctl(epfd, 2 /*EPOLL_CTL_DEL*/, workers[idx].pidfd, 0);
 
+    /* Temporarily set dumpable so Haskell can pidfd_getfd our memfds */
+    sys_prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+
     rsp.type = RSP_WORKER_RESERVED;
     rsp.worker_reserved.worker_id = (uint32_t)idx;
     rsp.worker_reserved.ring_fd = workers[idx].ring_fd;
     rsp.worker_reserved.code_fd = workers[idx].code_fd;
     rsp.worker_reserved.worker_pid = workers[idx].pid;
     send_response(&rsp);
+    dumpable_window = 1;  /* restored to non-dumpable on next command */
 }
 
 /* ── Handle release command ──────────────────────────────────────────── */
@@ -592,9 +597,9 @@ static void __attribute__((noreturn)) fork_server_main(void)
         send_response(&rsp);
     }
 
-    /* Fork server stays dumpable: Haskell uses pidfd_getfd to duplicate
-     * ring buffer/code memfds for direct dispatch. pidfd_getfd requires
-     * ptrace access which PR_SET_DUMPABLE=0 would block. */
+    /* Fork server: non-dumpable by default. Temporarily set dumpable
+     * in handle_reserve so Haskell can pidfd_getfd our memfds. */
+    sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 
     /* Create epoll */
     epfd = (int)sys_epoll_create1(0);
@@ -650,6 +655,12 @@ static void __attribute__((noreturn)) fork_server_main(void)
                 long r = read_full(sock_fd, &cmd, sizeof(cmd));
                 if (r <= 0)
                     sys_exit_group(0);
+
+                /* Close dumpable window after Haskell has done pidfd_getfd */
+                if (dumpable_window) {
+                    sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+                    dumpable_window = 0;
+                }
 
                 switch (cmd.type) {
                 case CMD_DISPATCH:
