@@ -69,7 +69,7 @@ data Response
   | RspWorkerCrashed !WorkerCrashedRsp
   | RspPoolStatus !PoolStatusRsp
   | RspError !Int32
-  | RspWorkerReserved !Word32        -- worker_id
+  | RspWorkerReserved !Word32 !Int32 !Int32 !Int32  -- worker_id, ring_fd, code_fd, worker_pid
   deriving (Show)
 
 data WorkerDoneRsp = WorkerDoneRsp
@@ -197,6 +197,9 @@ recvResponse fd = allocaBytes responseSize $ \buf -> do
       code <- peekI32 buf 4
       return (RspError code)
     6 -> do  -- RSP_WORKER_RESERVED
-      wid <- peekW32 buf 4
-      return (RspWorkerReserved wid)
+      wid     <- peekW32 buf 4
+      ringFd  <- peekI32 buf 8
+      codeFd  <- peekI32 buf 12
+      workerP <- peekI32 buf 16
+      return (RspWorkerReserved wid ringFd codeFd workerP)
     _ -> ioError (userError $ "recvResponse: unknown response type " ++ show rtype)

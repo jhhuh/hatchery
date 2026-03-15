@@ -74,7 +74,12 @@ struct response {
         struct rsp_worker_crashed worker_crashed;
         struct rsp_pool_status pool_status;
         struct { int32_t code; } error;
-        struct { uint32_t worker_id; } worker_reserved;
+        struct {
+            uint32_t worker_id;
+            int32_t  ring_fd;     /* fork server's fd for ring buffer memfd */
+            int32_t  code_fd;     /* fork server's fd for code memfd, -1 if none */
+            int32_t  worker_pid;
+        } worker_reserved;
     };
 };
 

@@ -57,6 +57,7 @@ static int pipe_fd;             /* pipe fd (parent-liveness) */
 static int injection_cap;
 static unsigned long code_region_size;
 static unsigned long ring_buf_size;
+static int epfd;                /* epoll fd */
 
 /* ── Forward declarations ───────────────────────────────────────────── */
 
@@ -498,8 +499,16 @@ static void handle_reserve(const struct command *cmd)
     }
 
     workers[idx].reserved = 1;
+
+    /* Remove worker's pidfd from epoll — Haskell owns crash detection now */
+    if (workers[idx].pidfd >= 0)
+        sys_epoll_ctl(epfd, 2 /*EPOLL_CTL_DEL*/, workers[idx].pidfd, 0);
+
     rsp.type = RSP_WORKER_RESERVED;
     rsp.worker_reserved.worker_id = (uint32_t)idx;
+    rsp.worker_reserved.ring_fd = workers[idx].ring_fd;
+    rsp.worker_reserved.code_fd = workers[idx].code_fd;
+    rsp.worker_reserved.worker_pid = workers[idx].pid;
     send_response(&rsp);
 }
 
@@ -510,6 +519,14 @@ static void handle_release(const struct command *cmd)
     int idx = (int)cmd->reserve_release.worker_id;
     if (idx >= 0 && idx < pool_size) {
         workers[idx].reserved = 0;
+
+        /* Re-add worker's pidfd to epoll */
+        if (workers[idx].pidfd >= 0) {
+            struct epoll_event ev;
+            ev.events = EPOLLIN;
+            ev.data.fd = workers[idx].pidfd;
+            sys_epoll_ctl(epfd, 1 /*EPOLL_CTL_ADD*/, workers[idx].pidfd, &ev);
+        }
     }
 }
 
@@ -579,7 +596,7 @@ static void __attribute__((noreturn)) fork_server_main(void)
     sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 
     /* Create epoll */
-    int epfd = (int)sys_epoll_create1(0);
+    epfd = (int)sys_epoll_create1(0);
     if (epfd < 0)
         sys_exit_group(50);
 
