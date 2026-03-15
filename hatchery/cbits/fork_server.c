@@ -7,6 +7,7 @@
 #include "syscall.h"
 #include "ring_buffer.h"
 #include "protocol.h"
+#include "seccomp_filter.h"
 
 #include <linux/mman.h>
 #include <linux/prctl.h>
@@ -157,6 +158,9 @@ static void __attribute__((noreturn)) worker_main(int ring_fd, int code_fd,
     /* Publish code region address in ring buffer */
     ring->code_base = (uint64_t)(unsigned long)code_base;
     ring->code_size = (uint64_t)cr_size;
+
+    /* Install seccomp filter BEFORE accepting any code */
+    install_seccomp_filter();
 
     /* Signal ready */
     atomic_store_explicit(&ring->status, WORKER_READY, memory_order_release);
