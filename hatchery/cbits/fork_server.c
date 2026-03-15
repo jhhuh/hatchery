@@ -152,9 +152,10 @@ static void __attribute__((noreturn)) worker_main(int ring_fd, int code_fd,
     if (code_fd >= 0)
         sys_close(code_fd);
 
-    /* NOTE: PR_SET_DUMPABLE=0 is intentionally omitted here.
-     * Setting it would block process_vm_writev from the fork server.
-     * Seccomp provides the main sandbox; dumpable is a secondary hardening. */
+    /* NOTE: Workers must stay dumpable — PR_SET_DUMPABLE=0 would block
+     * process_vm_writev from the fork server. The fork server itself is
+     * set non-dumpable (see fork_server_main). Seccomp is the primary
+     * sandbox for workers. */
 
     /* Publish code region address in ring buffer */
     ring->code_base = (uint64_t)(unsigned long)code_base;
@@ -495,6 +496,9 @@ static void __attribute__((noreturn)) fork_server_main(void)
         rsp.worker_ready.worker_id = (uint32_t)i;
         send_response(&rsp);
     }
+
+    /* Fork server: non-dumpable (hardening — nobody needs process_vm_writev on us) */
+    sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 
     /* Create epoll */
     int epfd = (int)sys_epoll_create1(0);
