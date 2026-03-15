@@ -15,6 +15,7 @@ import qualified Data.ByteString as BS
 import Data.Int
 import Data.Word
 import Control.Exception (throwIO, Exception, bracket)
+import Control.Monad (when)
 import Foreign.Ptr
 import Foreign.Storable (peek)
 import Foreign.Marshal.Alloc (alloca)
@@ -143,15 +144,20 @@ prepare h method codeBytes = do
 
       -- Duplicate fork server's fds into our process via pidfd_getfd
       fsPidfd <- c_pidfd_open (fromIntegral (hPid h))
+      when (fsPidfd < 0) $ ioError (userError "prepare: pidfd_open failed")
       localRingFd <- c_pidfd_getfd fsPidfd (fromIntegral remoteRingFd)
+      when (localRingFd < 0) $ ioError (userError "prepare: pidfd_getfd ring_fd failed")
       localCodeFd <- if remoteCodeFd >= 0
-        then c_pidfd_getfd fsPidfd (fromIntegral remoteCodeFd)
+        then do fd <- c_pidfd_getfd fsPidfd (fromIntegral remoteCodeFd)
+                when (fd < 0) $ ioError (userError "prepare: pidfd_getfd code_fd failed")
+                return fd
         else return (-1)
       _ <- c_close fsPidfd
 
       -- mmap the ring buffer
       let rbSize = ringBufSize (hConfig h)
       ringPtr <- c_mmap_ring localRingFd (fromIntegral rbSize)
+      when (ringPtr == nullPtr `plusPtr` (-1)) $ ioError (userError "prepare: mmap failed")
 
       let pw = PreparedWorker
             { pwHatchery  = h

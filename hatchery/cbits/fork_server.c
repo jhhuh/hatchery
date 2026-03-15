@@ -592,8 +592,9 @@ static void __attribute__((noreturn)) fork_server_main(void)
         send_response(&rsp);
     }
 
-    /* Fork server: non-dumpable (hardening — nobody needs process_vm_writev on us) */
-    sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    /* Fork server stays dumpable: Haskell uses pidfd_getfd to duplicate
+     * ring buffer/code memfds for direct dispatch. pidfd_getfd requires
+     * ptrace access which PR_SET_DUMPABLE=0 would block. */
 
     /* Create epoll */
     epfd = (int)sys_epoll_create1(0);
