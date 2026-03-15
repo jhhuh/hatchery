@@ -11,17 +11,26 @@
       pkgs = import nixpkgs { inherit system; };
       musl-cc = pkgs.pkgsStatic.stdenv.cc;
 
-      # Override haskellPackages with pinned llvm-ffi/llvm-tf versions
       hsPkgs = pkgs.haskellPackages.override {
-        overrides = hself: hsuper: {
-          llvm-ffi = hself.callHackage "llvm-ffi" "21.0.0.2" {};
-          llvm-tf  = hself.callHackage "llvm-tf"  "21.0" {};
-        };
+        overrides = pkgs.lib.composeManyExtensions [
+          # Local packages
+          (pkgs.haskell.lib.packageSourceOverrides {
+            hatchery      = ./hatchery;
+            hatchery-llvm = ./hatchery-llvm;
+            trustless-ffi = ./trustless-ffi;
+          })
+          # Pinned Hackage versions
+          (hself: hsuper: {
+            llvm-ffi = hself.callHackage "llvm-ffi" "21.0.0.2" {
+              LLVM = pkgs.llvmPackages_19.llvm;
+            };
+            llvm-tf  = hself.callHackage "llvm-tf"  "21.0" {};
+          })
+        ];
       };
 
-      # Dev shell with all Haskell deps pre-built
       haskellShell = hsPkgs.shellFor {
-        packages = _: [];  # local packages built by cabal, not nix
+        packages = p: [ p.hatchery p.hatchery-llvm p.trustless-ffi ];
         buildInputs = [
           pkgs.cabal-install
           musl-cc
