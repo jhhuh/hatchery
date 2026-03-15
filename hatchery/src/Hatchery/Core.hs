@@ -95,7 +95,7 @@ withHatchery cfg action = inBoundThread $
         (codeRegionSize cfg)
         (ringBufSize cfg)
         sc
-      idleVar <- newMVar []
+      idleVar <- newEmptyMVar
       infoRef <- newIORef []
       return $ Hatchery
         { hSockFd      = Fd (fromIntegral (srSockFd sr))
