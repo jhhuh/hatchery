@@ -313,5 +313,5 @@ The spin-wait (~365ns) and futex (~3100ns) dispatch latency numbers are properti
 
 ---
 
-*Session: 2026-03-15, Claude Opus 4.6. Model ID: claude-opus-4-6[1m].*
+*Session: 2026-03-15, Claude Opus 4.6. Model ID: claude-opus-4-6[1m]. Session ID: 919c38de-05cd-402c-bbf5-e3dba6df4a9c.*
 *Conversation flow: payload-agnostic hatchery → Image with three components → opaque effectful lens → observation mutates → Machine type connection → coalgebraic Object → Egg reification → Hatchery typeclass → clean master.*
