@@ -2,6 +2,7 @@
 #ifndef HATCHERY_SYSCALL_H
 #define HATCHERY_SYSCALL_H
 
+#include <stdint.h>
 #include <linux/types.h>
 
 /* ── Syscall numbers (x86_64) ─────────────────────────────────────── */
@@ -171,8 +172,8 @@ static inline long sys_memfd_create(const char *name, unsigned int flags)
     return sys_call2(__NR_memfd_create, (long)name, (long)flags);
 }
 
-static inline long sys_futex(int *uaddr, int op, int val,
-                              const void *timeout, int *uaddr2, int val3)
+static inline long sys_futex(uint32_t *uaddr, int op, uint32_t val,
+                              const void *timeout, uint32_t *uaddr2, uint32_t val3)
 {
     return sys_call6(__NR_futex, (long)uaddr, (long)op, (long)val,
                      (long)timeout, (long)uaddr2, (long)val3);
