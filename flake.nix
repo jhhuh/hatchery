@@ -16,9 +16,10 @@
       hsPkgs = pkgs.haskellPackages.override {
         overrides = pkgs.lib.composeManyExtensions [
           (pkgs.haskell.lib.packageSourceOverrides {
-            hatchery      = ./hatchery;
-            hatchery-llvm = ./hatchery-llvm;
-            trustless-ffi = ./trustless-ffi;
+            hatchery       = ./hatchery;
+            hatchery-bench = ./hatchery-bench;
+            hatchery-llvm  = ./hatchery-llvm;
+            trustless-ffi  = ./trustless-ffi;
           })
           (hself: hsuper: {
             # llvm-ffi: follow nixpkgs pattern — LLVM = null, add .lib/.dev
@@ -56,10 +57,11 @@
       };
     in {
       packages.${system} = {
-        hatchery      = hsPkgs.hatchery;
-        hatchery-llvm = hsPkgs.hatchery-llvm;
-        trustless-ffi = hsPkgs.trustless-ffi;
-        default       = hsPkgs.hatchery;
+        hatchery       = hsPkgs.hatchery;
+        hatchery-bench = hsPkgs.hatchery-bench;
+        hatchery-llvm  = hsPkgs.hatchery-llvm;
+        trustless-ffi  = hsPkgs.trustless-ffi;
+        default        = hsPkgs.hatchery;
       };
       devShells.${system}.default = haskellShell;
     };

@@ -5,7 +5,7 @@ module Hatchery.Core
   , withHatchery
   ) where
 
-import Control.Concurrent (runInBoundThread)
+import Control.Concurrent (rtsSupportsBoundThreads, runInBoundThread)
 import Control.Exception (bracket, SomeException, catch)
 import System.Posix.Types (Fd(..))
 import System.Posix.IO (closeFd)
@@ -30,11 +30,11 @@ injCapToInt SharedMemfdOnly     = 1
 injCapToInt BothMethods         = 2
 
 -- | Create a hatchery, run the action, then shut it down.
--- Uses runInBoundThread to ensure the vfork happens on a bound OS thread,
--- so PR_SET_PDEATHSIG on the fork server fires at the right time.
--- Works with both -threaded and single-threaded RTS.
+-- With -threaded RTS, uses runInBoundThread to ensure vfork happens on a
+-- bound OS thread (PDEATHSIG safe). With single-threaded RTS, runs directly
+-- (only one OS thread, PDEATHSIG is inherently safe).
 withHatchery :: HatcheryConfig -> (Hatchery -> IO a) -> IO a
-withHatchery cfg action = runInBoundThread $
+withHatchery cfg action = inBoundThread $
   bracket acquire release $ \h -> do
     -- Wait for all workers to report ready
     waitForWorkers h
@@ -64,3 +64,9 @@ withHatchery cfg action = runInBoundThread $
       let n = poolSize cfg
       mapM_ (\_ -> recvResponse (hSockFd h)) [1..n]
       -- Each should be RspWorkerReady; for now just consume them
+
+-- | Run action on a bound thread if -threaded, otherwise run directly.
+inBoundThread :: IO a -> IO a
+inBoundThread
+  | rtsSupportsBoundThreads = runInBoundThread
+  | otherwise               = id
