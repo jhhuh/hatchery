@@ -1,14 +1,14 @@
 # hatchery
 
-Trustless computation for runtime codegen. Execute JIT-compiled or foreign machine code in process-isolated sandboxes with microsecond dispatch latency.
+Trustless computation for runtime codegen. Execute JIT-compiled or foreign machine code with full process isolation at FFI-competitive latency.
 
-Generate code at runtime with LLVM, run it in a pre-spawned worker pool, and get results back — with the guarantee that crashes, hangs, and wild writes cannot propagate to the host.
+Generate code at runtime with LLVM, dispatch it, and get results back — with the guarantee that crashes, hangs, and wild writes cannot propagate to the host. Dispatch overhead is ~3-5 microseconds, on par with GHC's native FFI calling convention.
 
 ## Packages
 
 | Package | Description |
 |---|---|
-| **hatchery** | Core sandbox primitives — fork server, worker pool, dual code injection, ring buffer IPC |
+| **hatchery** | Core sandbox primitives — process isolation, dual code injection, ring buffer IPC |
 | **hatchery-llvm** | LLVM IR to machine code bridge via `llvm-tf` |
 | **trustless-ffi** | Ergonomic wrapper — foreign calls that can't crash your program |
 
@@ -27,9 +27,9 @@ GHC Process (Haskell)
         └──► ...              PROT_RWX code region + MAP_SHARED ring buffer
 ```
 
-The fork server is a minimal C binary (~600 lines, musl static-PIE, no libc dependency) embedded in the Haskell binary at compile time. It manages a pool of pre-spawned workers. Code is injected into workers via `process_vm_writev` or shared memfd, then executed by waking the worker with a futex.
+A minimal C supervisor (~600 lines, musl static-PIE, no libc) is embedded in the Haskell binary at compile time. Sandboxed execution contexts are pre-warmed so that dispatch is a memfd write + futex wake — no process spawn on the hot path.
 
-**Dispatch latency**: ~3-5 microseconds (excluding code execution time).
+**Dispatch latency**: ~3-5 microseconds, comparable to GHC's native `ccall` FFI overhead.
 
 ## Quick start
 
