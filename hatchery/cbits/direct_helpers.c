@@ -168,3 +168,17 @@ void *hatchery_result_data(void *ring_base)
     uint32_t *ro = (uint32_t *)((char *)ring_base + RING_RESULT_OFF_OFF);
     return (char *)ring_base + RING_DATA_OFF + *ro;
 }
+
+/* Write code bytes to mmap'd code memfd region and update code_len in ring buffer */
+void hatchery_write_code(void *ring_base, void *code_ptr, const void *src, uint32_t len)
+{
+    __builtin_memcpy(code_ptr, src, len);
+    uint32_t *cl = (uint32_t *)((char *)ring_base + offsetof(struct ring_buffer, code_len));
+    *cl = len;
+}
+
+/* mmap code memfd for direct writes from Haskell */
+void *hatchery_mmap_code(int fd, unsigned long size)
+{
+    return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+}
