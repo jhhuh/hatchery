@@ -1,36 +1,129 @@
-# hatchery / trustless-ffi
+# hatchery
 
-Trustless computation for runtime codegen. Execute JIT-compiled or foreign machine code with full process isolation and fault tolerance, at FFI-competitive latency.
+Type-safe sandboxed computation via coalgebraic objects.
 
-Generate code at runtime with LLVM, dispatch it, and get results back — with the guarantee that crashes, hangs, and wild writes cannot propagate to the host. If foreign code segfaults, you get a `Crashed` result, not a dead process.
+Hatchery models isolated execution as an **abstract computer**: you define a blueprint (an Egg), hatch it into a live mutable object, and interact with it through typed methods. The object is backed by process isolation, but the abstraction is general — the same Egg/Object interface can target different backends.
+
+## Core Concepts
+
+### Object: Coalgebraic Mutable Machine
+
+An Object is defined not by its internal state but by its **observable behavior** — a set of typed methods, each of which mutates the object and returns a result.
+
+```haskell
+data Object f m = Object
+  { method :: forall t. f t -> m (t, Object f m)
+  }
+```
+
+Every interaction — even observation — mutates. There is no pure read. The returned `Object` is the machine after the state transition. This reflects physical reality: the object is backed by a live process where reading a register or probing memory are effectful operations that transition the system.
+
+The GADT `f` defines the method list. Each constructor is a typed method:
+
+```haskell
+data CCall t where
+  LoadFunction :: ByteString -> CCall ()
+  SetArg       :: Word8 -> Word64 -> CCall ()
+  Call         :: CCall ExecStatus
+  GetReturn    :: CCall Word64
+```
+
+### Egg: Reification Recipe
+
+An Egg is the blueprint for a live object. It fuses two things:
+
+1. **A seed** — concrete configuration for the physical resources (memory layout, security policy, resource limits)
+2. **A GADT method list + interpreter** — the abstract behavioral specification paired with its implementation as a natural transformation `f ~> IO`
+
+```haskell
+data Egg img f = Egg
+  { eConfig      :: WorkerConfig
+  , eInterpreter :: img -> f ~> IO
+  }
+```
+
+The `hatch` operation reifies this into a live `Object f m` by allocating resources from the seed and wiring the interpreter to the mutable Image.
+
+### Hatchery: Backend Typeclass
+
+Hatchery is a typeclass — not a concrete implementation. It defines the capability to incubate eggs into objects. Different backends provide different isolation mechanisms.
+
+```haskell
+class Hatchery h where
+  type HatchPool h
+  type HatchConfig h
+  type HatchImage h
+  withPool :: HatchConfig h -> (HatchPool h -> IO a) -> IO a
+  hatch    :: HatchPool h -> Egg (HatchImage h) f -> IO (Object f IO)
+```
+
+### Compositionality
+
+Method lists compose via coproduct. An `(f :+: g)` object supports methods from both `f` and `g`:
+
+```haskell
+combine :: Egg img f -> Egg img g -> Egg img (f :+: g)
+```
+
+## Example
+
+```haskell
+main = withPool defaultConfig $ \pool -> do
+  -- Hatch a C-calling-convention computer
+  calc <- hatch pool ccallEgg
+
+  -- Load a compiled function, set arguments, call it
+  (_, c) <- call calc (LoadFunction addCode)
+  (_, c) <- call c (SetArg 0 17)
+  (_, c) <- call c (SetArg 1 25)
+  (_, c) <- call c Call
+  (answer, _) <- call c GetReturn   -- 42
+  print answer
+```
+
+Or with raw machine code:
+
+```haskell
+main = withPool defaultConfig $ \pool -> do
+  computer <- hatch pool rawX86Egg
+
+  -- mov eax, 42; ret
+  let code = BS.pack [0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3]
+  (_, c) <- call computer (Inject code)
+  (status, c) <- call c Run
+  (result, _) <- call c Result
+  print result  -- (42, Nothing)
+```
 
 ## Packages
 
 | Package | Description |
 |---|---|
-| **hatchery** | Core sandbox primitives — process isolation, dual code injection, ring buffer IPC |
-| **hatchery-bench** | Benchmarks — FFI baseline comparison, fault tolerance demo |
+| **hatchery** | Core abstractions: `Object`, `Egg`, `Hatchery` typeclass, compositional combinators |
+| **hatchery-linux** | `LinuxWorkerPool` backend: fork server, seccomp, x86-64 process isolation |
+| **hatchery-ccall** | `CCall` egg: System V AMD64, register mappings, calling conventions |
+| **hatchery-bench** | Benchmarks |
 | **hatchery-llvm** | LLVM IR to machine code bridge via `llvm-tf` (stub) |
-| **trustless-ffi** | Ergonomic wrapper — foreign calls that can't crash your program |
+| **trustless-ffi** | High-level typed FFI built on CCall egg |
 
-## Architecture
+## LinuxWorkerPool Backend
+
+The `hatchery-linux` package provides a concrete `Hatchery` instance using pre-spawned worker processes with seccomp filtering on Linux x86-64.
 
 ```
 GHC Process (Haskell)
   │
   │  socketpair (control)     pipe (parent-liveness)
   │
-  └──► Fork Server            static-PIE C binary, compiled + embedded at TH time
-        │                     single-threaded, epoll-based, no libc, raw syscalls
+  └──► Fork Server            static-PIE C binary, embedded at TH time
+        │                     single-threaded, epoll, no libc, raw syscalls
         │
         ├──► Worker 0         own address space, seccomp-filtered
         ├──► Worker 1         spin/futex-suspended until dispatch
         └──► ...              PROT_RWX code region + MAP_SHARED ring buffer
 ```
 
-A minimal C supervisor (~750 lines, musl static-PIE, no libc) is embedded in the Haskell binary at compile time via Template Haskell. Sandboxed execution contexts are pre-warmed so that dispatch is a memfd write + futex wake — no process spawn on the hot path.
-
-### Measured latency (return 42 workload, 100k iterations)
+### Measured latency (return 42, 100k iterations)
 
 ```
 foreign import prim:       0.3 ns/call  (register shuffle, no stack frame)
@@ -38,108 +131,37 @@ unsafe ccall:              1.4 ns/call  (C ABI overhead)
 safe ccall:               68   ns/call  (releases GHC capability)
 hatchery (spin-wait Cmm): 365  ns/call  (Cmm spin, no futex syscalls)
 hatchery (spin-wait C):   370  ns/call  (C spin, GCC-inlined atomics)
-hatchery (pre-loaded):   3100  ns/call  (direct futex wake/wait, no fork server)
+hatchery (pre-loaded):   3100  ns/call  (direct futex wake/wait)
 hatchery (vm_writev):    5500  ns/call  (code injection + fork server relay)
 hatchery (memfd):        5950  ns/call  (code injection + fork server relay)
 ```
 
-Spin-wait (~365ns) is at the hardware floor — two cross-process cache-line round-trips.
-Works with both `-threaded` and single-threaded GHC RTS.
+### Platform requirements
 
-## Quick start
-
-```haskell
-import Hatchery
-import qualified Data.ByteString as BS
-
-main :: IO ()
-main = do
-  -- Raw x86_64 machine code: mov eax, 42; ret
-  let code = BS.pack [0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3]
-
-  withHatchery defaultConfig $ \h -> do
-    result <- dispatch h UseSharedMemfd code
-    case result of
-      Completed exitCode _ -> print exitCode  -- 42
-      Crashed signal       -> error $ "crashed: " ++ show signal
-```
-
-Or with the higher-level `trustless-ffi` API:
-
-```haskell
-import TrustlessFFI
-import qualified Data.ByteString as BS
-
-main :: IO ()
-main = do
-  let code = BS.pack [0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3]
-
-  withFFI defaultFFIConfig $ \ffi -> do
-    result <- call ffi code
-    case result of
-      Success exitCode _ -> print exitCode
-      ForeignCrash msg   -> putStrLn msg
-      Timeout            -> putStrLn "timed out"
-```
-
-## Code injection methods
-
-The pool's `InjectionCapability` determines how workers set up their code regions. Per-dispatch, you choose which method to use.
-
-| Capability | Code region | Available methods |
-|---|---|---|
-| `ProcessVmWritevOnly` | `MAP_PRIVATE\|MAP_ANONYMOUS` | `UseProcessVmWritev` only |
-| `SharedMemfdOnly` | `MAP_SHARED` from memfd | `UseSharedMemfd` only |
-| `BothMethods` (default) | `MAP_SHARED` from memfd | Either, per-dispatch |
-
-**`process_vm_writev`**: Cross-process memory write. Fork server writes code directly into the worker's address space. Requires workers to be dumpable (they are).
-
-**Shared memfd**: Fork server writes code to a memfd that the worker has mapped. No cross-process write needed.
+- Linux x86-64
+- Kernel >= 5.3 (`pidfd_open`)
+- Kernel >= 3.17 (`memfd_create`)
 
 ## Building
 
 Requires Nix. The flake provides GHC, musl cross-compiler, LLVM 19, and all Haskell dependencies.
 
 ```bash
-# Build library
 nix build .#hatchery
-
-# Build and run benchmarks
 nix build .#hatchery-bench
-result/bin/hatchery-bench
-
-# Interactive development
 nix develop -c cabal build all
 ```
 
-The fork server binary is compiled at Template Haskell time via `$HATCHERY_CC` (musl cross-compiler, set automatically by the nix flake). No separate build step needed.
-
-## Platform requirements
-
-- Linux x86_64
-- Kernel >= 5.3 (`pidfd_open`)
-- Kernel >= 3.17 (`memfd_create`)
-
-## Lifecycle guarantees
-
-1. **Haskell dies → fork server dies**: Dual mechanism — pipe trick (process-scoped fd, POLLHUP on parent death) + `PR_SET_PDEATHSIG=SIGKILL` (safe via `runInBoundThread`).
-2. **Fork server dies → all workers die**: Workers have `PDEATHSIG=SIGKILL` set.
-3. **Worker crashes → detected**: Fork server detects via `wait4(WNOHANG)` and reports `Crashed` to Haskell.
-
-## Dispatch modes
-
-| Mode | Latency | Use case |
-|---|---|---|
-| `dispatch` | ~5.5 μs | One-shot: inject code + execute + return result |
-| `prepare` / `run` | ~3.1 μs (futex) or ~365 ns (spin) | Pre-load code once, re-run many times |
-
-**Spin-wait** (`SpinWait N`): Worker and Haskell spin N iterations before falling back to futex. Eliminates syscalls on the hot path. Configurable via `waitStrategy` in `HatcheryConfig`.
-
 ## Status
 
-Phase 1 complete, Phase 2 partial. Core sandbox works end-to-end with both injection methods, crash detection, and spin-wait mode.
+**Rebuilding from new foundations.** The previous implementation (pool of worker processes with hardcoded `int fn(void)` dispatch) is frozen on the [`v1-worker-pool`](../../tree/v1-worker-pool) branch. The core sandbox machinery (fork server, spin-wait, ring buffer IPC) is proven and its latency characteristics are well-understood — it becomes the `LinuxWorkerPool` backend instance of the new `Hatchery` typeclass.
 
-**Not yet implemented**: worker respawn on crash, PID namespace isolation (`CLONE_NEWPID`), dispatch timeout enforcement, LLVM codegen (stubbed), direct memfd writes for `dispatch` (would cut one-shot latency to ~3μs).
+The new architecture introduces payload-agnostic abstractions:
+- `Object f m` — coalgebraic mutable machine with typed GADT methods
+- `Egg img f` — reification recipe pairing concrete seed with abstract method list
+- `Hatchery h` — typeclass for sandbox backends
+
+See [`docs/plans/2026-03-15-egg-object-architecture-design.md`](docs/plans/2026-03-15-egg-object-architecture-design.md) for the full design document.
 
 ## License
 
