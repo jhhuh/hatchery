@@ -1,6 +1,7 @@
 module Hatchery
   ( -- * Core
     Hatchery
+  , WorkerMapping(..)
   , withHatchery
   , HatcheryConfig(..)
   , defaultConfig
@@ -20,5 +21,5 @@ module Hatchery
   ) where
 
 import Hatchery.Config
-import Hatchery.Core (Hatchery, withHatchery)
+import Hatchery.Core (Hatchery, WorkerMapping(..), withHatchery)
 import Hatchery.Dispatch
