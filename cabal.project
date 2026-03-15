@@ -1,2 +1,4 @@
 packages:
   hatchery/
+  hatchery-llvm/
+  trustless-ffi/
