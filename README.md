@@ -9,7 +9,8 @@ Generate code at runtime with LLVM, dispatch it, and get results back — with t
 | Package | Description |
 |---|---|
 | **hatchery** | Core sandbox primitives — process isolation, dual code injection, ring buffer IPC |
-| **hatchery-llvm** | LLVM IR to machine code bridge via `llvm-tf` |
+| **hatchery-bench** | Benchmarks — FFI baseline comparison, fault tolerance demo |
+| **hatchery-llvm** | LLVM IR to machine code bridge via `llvm-tf` (stub) |
 | **trustless-ffi** | Ergonomic wrapper — foreign calls that can't crash your program |
 
 ## Architecture
@@ -20,16 +21,25 @@ GHC Process (Haskell)
   │  socketpair (control)     pipe (parent-liveness)
   │
   └──► Fork Server            static-PIE C binary, compiled + embedded at TH time
-        │                     single-threaded, epoll-based, no libc
+        │                     single-threaded, epoll-based, no libc, raw syscalls
         │
         ├──► Worker 0         own address space, seccomp-filtered
         ├──► Worker 1         futex-suspended until dispatch
         └──► ...              PROT_RWX code region + MAP_SHARED ring buffer
 ```
 
-A minimal C supervisor (~600 lines, musl static-PIE, no libc) is embedded in the Haskell binary at compile time. Sandboxed execution contexts are pre-warmed so that dispatch is a memfd write + futex wake — no process spawn on the hot path.
+A minimal C supervisor (~600 lines, musl static-PIE, no libc) is embedded in the Haskell binary at compile time via Template Haskell. Sandboxed execution contexts are pre-warmed so that dispatch is a memfd write + futex wake — no process spawn on the hot path.
 
-**Dispatch latency**: ~5-6 microseconds, comparable to GHC's native `ccall` FFI overhead.
+### Measured latency (return 42 workload)
+
+```
+unsafe ccall:          <0.01 us/call
+safe ccall:             0.07 us/call
+hatchery (vm_writev):   5.08 us/call  (full process isolation + seccomp)
+hatchery (memfd):       5.33 us/call  (full process isolation + seccomp)
+```
+
+Works with both `-threaded` and single-threaded GHC RTS.
 
 ## Quick start
 
@@ -86,14 +96,15 @@ The pool's `InjectionCapability` determines how workers set up their code region
 Requires Nix. The flake provides GHC, musl cross-compiler, LLVM 19, and all Haskell dependencies.
 
 ```bash
-# Full build (fork server compiles automatically via TH)
+# Build library
 nix build .#hatchery
+
+# Build and run benchmarks
+nix build .#hatchery-bench
+result/bin/hatchery-bench
 
 # Interactive development
 nix develop -c cabal build all
-
-# Run the bench/test binary (built by nix build)
-result/bin/hatchery-bench
 ```
 
 The fork server binary is compiled at Template Haskell time via `$HATCHERY_CC` (musl cross-compiler, set automatically by the nix flake). No separate build step needed.
@@ -106,9 +117,9 @@ The fork server binary is compiled at Template Haskell time via `$HATCHERY_CC` (
 
 ## Lifecycle guarantees
 
-1. **Haskell dies -> fork server dies**: The fork server monitors a pipe to the parent. When the parent exits, the pipe closes, and the fork server exits.
-2. **Fork server dies -> all workers die**: Workers have `PDEATHSIG=SIGKILL` set.
-3. **Worker crashes -> detected**: Fork server detects via pidfd and reports `Crashed` to Haskell.
+1. **Haskell dies → fork server dies**: Dual mechanism — pipe trick (process-scoped fd, POLLHUP on parent death) + `PR_SET_PDEATHSIG=SIGKILL` (safe via `runInBoundThread`).
+2. **Fork server dies → all workers die**: Workers have `PDEATHSIG=SIGKILL` set.
+3. **Worker crashes → detected**: Fork server detects via `wait4(WNOHANG)` and reports `Crashed` to Haskell.
 
 ## Status
 
